@@ -151,7 +151,9 @@ function settingsSchema(S) {
   })
 }
 // 0.1.7 loader 通过 entry.fiber.runtime.Config 自动发现 schema，必须在模块顶层导出。
-const Config = settingsSchema(Schema)
+// settingsSchema 降级返回 null，导出必须归一成 undefined——宿主 schema() 只排除
+// undefined，"toJSON" in null 会炸 settings.describe()（同 dsh-continue#4）。
+const Config = settingsSchema(Schema) ?? undefined
 
 /** `$DSH_HOME`-aware roots, mirroring skills-management's installedDir logic. */
 function dshHome() {
