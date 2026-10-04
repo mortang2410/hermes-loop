@@ -7,7 +7,7 @@
  * (render through the slot tree). Colors ride the --dsw-* theme tokens.
  */
 window.__ModuleLoader__.load({
-  id: '@weibaohui/hermes-loop',
+  id: '@local/hermes-loop-i18n',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -610,7 +610,7 @@ window.__ModuleLoader__.load({
     }
 
     module.exports = {
-      name: '@weibaohui/hermes-loop',
+      name: '@local/hermes-loop-i18n',
       inject: ['slots', 'locale'],
       apply: function (ctx) {
         var NS = 'hermes-loop'

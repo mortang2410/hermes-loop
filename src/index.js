@@ -43,6 +43,55 @@ let Schema = loadSchemastery()
 
 const KEbab_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const DESCRIPTION_MAX = 500
+
+// ── Local fork: language follows the DSH locale preference (route A) ─────────
+//
+// Upstream hard-codes Chinese into three model-facing surfaces (review prompt,
+// long-term-memory snapshot, loop-aware section). dsh ships no cross-plane
+// locale service — the browser owns the only live instance, and the sole
+// durable trace is `preference` in the settings document under the namespace
+// `locale`, written by the Language row. So the host reads that document,
+// exactly as it already does for its own namespace a few lines below.
+//
+// Absence is the tricky half: an unset `preference` does NOT mean English.
+// The client falls back to browser detection (LocaleRuntime.resolveActive),
+// which the host cannot see. We therefore read the same durable document the
+// client reads and honour absence as "no explicit choice" → upstream Chinese,
+// never inventing an English default the user never picked.
+const LOCALE_SETTINGS_NS = 'locale'
+const DEFAULT_LANGUAGE = 'zh'
+
+/**
+ * Read the durable locale preference out of the settings document.
+ *
+ * @param ctx Plugin context, used only for its `settings.describe` projection.
+ * @returns {{ value: string|undefined, seen: boolean }} `seen` distinguishes a readable
+ * document with no explicit preference from an unreadable one, so a settings
+ * service that has not mounted yet is never mistaken for an unset preference.
+ */
+function readLocalePreference(ctx, namespace) {
+  try {
+    if (!ctx.settings || typeof ctx.settings.describe !== 'function') return { value: undefined, seen: false }
+    const descriptor = ctx.settings.describe().find((row) => row.ns === LOCALE_SETTINGS_NS)
+    if (!descriptor) return { value: undefined, seen: false }
+    const value = descriptor.value && typeof descriptor.value === 'object' ? descriptor.value.preference : undefined
+    // An explicit, still-registered locale id; anything else is "no choice".
+    if (typeof value !== 'string' || !/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u.test(value)) {
+      return { value: undefined, seen: true }
+    }
+    return { value: value.toLowerCase(), seen: true }
+  } catch { return { value: undefined, seen: false } }
+}
+
+/**
+ * Collapse a locale id onto the languages this fork carries dictionaries for.
+ *
+ * @param {string} [value] A locale id such as `en`, `zh-CN`, or `zh-Hans-CN`.
+ * @returns {'zh'|'en'} `zh` whenever the id is absent or does not start with `en`.
+ */
+function languageOf(value) {
+  return typeof value === 'string' && value.toLowerCase().startsWith('en') ? 'en' : 'zh'
+}
 const BODY_MAX_CHARS = 128 * 1024
 const SUSPECT_BODY_MAX_CHARS = 8 * 1024
 const TRANSCRIPT_MESSAGE_CAP = 40
@@ -560,12 +609,73 @@ async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enab
   return { result: plan.result, store, chars: plan.chars, entries: plan.entries.length, limit }
 }
 
+// ── Local fork: model-facing copy, one entry per supported language ────────
+//
+// zh entries are upstream's literals verbatim, so an unset preference produces
+// byte-identical output to 0.1.16 and the fork is a no-op until the user picks
+// a language in Settings → Language. `en` is the fork's whole contribution.
+const MEMORY_CONTEXT_TEXT = {
+  zh: {
+    heading: '# 长期记忆（跨会话持久，后台复盘按需维护；以下为最新全量快照）',
+    userTitle: 'USER（用户画像/偏好）',
+    memoryTitle: 'MEMORY（环境/项目事实/约定/教训）',
+    chars: '字符',
+    items: '条',
+  },
+  en: {
+    heading: '# Long-term memory (persists across sessions, maintained on demand by the background review; this is the latest full snapshot)',
+    userTitle: 'USER (user profile / preferences)',
+    memoryTitle: 'MEMORY (environment facts, project facts, conventions, lessons)',
+    chars: 'chars',
+    items: 'entries',
+  },
+}
+
+const REVIEW_MEMORY_BLOCK_TEXT = {
+  zh: { section: '当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）', items: '条', empty: '（空）' },
+  en: { section: 'Current memory entries (oldText must match exactly one entry\'s original text; omit the memory field entirely when nothing is worth recording)', items: 'entries', empty: '(empty)' },
+}
+
+const LOOP_AWARE_TEXT = {
+  zh: [
+    '# 收尾沉淀（后台学习循环在运行）',
+    '',
+    '- 收尾时若发现**本会话已加载的 skill** 有错、缺步骤或过时：直接用你的工具**当场修正它**，不要留到后台复盘（后台也会复盘，但当场修的上下文最全）。',
+    '- 其余沉淀（新 skill、经验教训）交给后台学习循环处理，**不要**主动写新 skill 文件——避免两套纪律打架。',
+  ],
+  en: [
+    '# Wrap-up distillation (the background learning loop is running)',
+    '',
+    '- When wrapping up, if you find that a **skill loaded in this session** is wrong, missing steps, or outdated: fix it **immediately with your own tools** rather than leaving it to the background review (the background review will also catch it, but your context here is the most complete one).',
+    '- Leave all other distillation (new skills, lessons learned) to the background learning loop. **Do not** proactively write new skill files — two competing sets of instructions would fight each other.',
+  ],
+}
+
+const REVIEW_INPUT_TEXT = {
+  zh: {
+    catalog: '既有 skill 清单（name: description）',
+    suspects: '疑似相关 skill 全文',
+    transcript: '会话转写（保尾截断）',
+    reasoning: '（推理中）',
+  },
+  en: {
+    catalog: 'Existing skill catalog (name: description)',
+    suspects: 'Full text of likely-relevant skills',
+    transcript: 'Session transcript (tail-preserving truncation)',
+    reasoning: '(reasoning)',
+  },
+}
+
 /**
  * 渲染注入文本（design §12.2）。readRaw(store) 由调用方提供（同步读、缺文件返回 ''），
  * 本函数只做渲染：两库全空/全关返回 ''（renderContextSections 会过滤空文本，快照整体
  * 不出现）。库里容错：单库读取失败按空库渲染，不让一次 IO 故障扩散。
+ *
+ * 本地分支：lang 选字典（'zh' 保持上游原文，'en' 走英文表）。条目正文是用户/复盘
+ * 自己写的，不翻译——只翻译本函数生成的框架文字。
  */
-function renderMemoryContext(eff, readRaw) {
+function renderMemoryContext(eff, readRaw, lang) {
+  const T = MEMORY_CONTEXT_TEXT[languageOf(lang)]
   const sections = []
   for (const store of MEMORY_STORES) {
     if (!memoryStoreEnabled(store, eff)) continue
@@ -573,12 +683,12 @@ function renderMemoryContext(eff, readRaw) {
     try { entries = parseMemoryEntries(readRaw(store)) } catch { entries = [] }
     if (entries.length === 0) continue
     const chars = memoryCharsOf(entries)
-    const title = store === 'user' ? 'USER（用户画像/偏好）' : 'MEMORY（环境/项目事实/约定/教训）'
-    sections.push(`## ${title} — ${chars}/${memoryStoreLimit(store, eff)} 字符 · ${entries.length} 条\n${entries.map((e) => '§ ' + e).join('\n')}`)
+    const title = store === 'user' ? T.userTitle : T.memoryTitle
+    sections.push(`## ${title} — ${chars}/${memoryStoreLimit(store, eff)} ${T.chars} · ${entries.length} ${T.items}\n${entries.map((e) => '§ ' + e).join('\n')}`)
   }
   if (sections.length === 0) return ''
   return [
-    '# 长期记忆（跨会话持久，后台复盘按需维护；以下为最新全量快照）',
+    T.heading,
     '',
     sections.join('\n\n'),
   ].join('\n')
@@ -670,24 +780,11 @@ function curatorTransitions(records, usage, { now, staleDays, archiveDays }) {
 
 // ── Review prompt (ported from Hermes _SKILL_REVIEW_PROMPT, design §4) ──
 // memory 增补段只在任一记忆库启用时出现（§12.3：两开关全关 = 协议退回 skill 单结论）。
-
-function reviewPrompt(eff = {}) {
-  const memoryOn = MEMORY_STORES.some((s) => {
-    const enabled = s === 'user' ? eff.userProfileEnabled : eff.memoryEnabled
-    return enabled !== false
-  })
-  const memorySection = memoryOn ? [
-    '',
-    '## 记忆（可选结论——多数复盘应该没有记忆）',
-    '除 skill 外，只有对话**明确暴露**了以下内容才考虑写记忆：',
-    '- 用户画像、偏好、对你行为方式的期望 → store="user"；',
-    '- 环境/项目事实、约定、教训（如"发布必须 OTP""服务跑在 19080 端口"）→ store="memory"；',
-    '- 流程、步骤、坑 → 仍归 skill，绝不写进记忆。',
-    '按需产出：没有明确值得记的就省略 memory 字段，不为写而写——记忆库是小限额精编清单，平庸条目会挤掉真条目，而漏记几乎零成本。',
-    '库接近上限时优先 replace（合并改写既有条目）或 remove（删过时条目），而不是 add。',
-    '',
-  ] : []
-  return [
+//
+// 本地分支：按 lang 取整段协议文本。结构、信号清单、负面清单与 JSON 字段名逐行对齐——
+// 只换语言，不换语义，否则复盘 agent 的判定行为会随语言漂移。
+const REVIEW_PROMPT_TEXT = {
+  zh: (memoryOn) => [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
     '',
     '## 主动倾向',
@@ -714,7 +811,17 @@ function reviewPrompt(eff = {}) {
     '## 命名纪律',
     'kebab-case class-level 名字。禁止 PR 号、错误串、一次性代号（fix-X / debug-Y 之类）。',
     '如果名字只对今天的任务有意义，那就是错的——回到优先序 1/2 去扩写既有 skill。',
-    ...memorySection,
+    ...(memoryOn ? [
+      '',
+      '## 记忆（可选结论——多数复盘应该没有记忆）',
+      '除 skill 外，只有对话**明确暴露**了以下内容才考虑写记忆：',
+      '- 用户画像、偏好、对你行为方式的期望 → store="user"；',
+      '- 环境/项目事实、约定、教训（如"发布必须 OTP""服务跑在 19080 端口"）→ store="memory"；',
+      '- 流程、步骤、坑 → 仍归 skill，绝不写进记忆。',
+      '按需产出：没有明确值得记的就省略 memory 字段，不为写而写——记忆库是小限额精编清单，平庸条目会挤掉真条目，而漏记几乎零成本。',
+      '库接近上限时优先 replace（合并改写既有条目）或 remove（删过时条目），而不是 add。',
+      '',
+    ] : []),
     '## 分工',
     memoryOn
       ? '流程、步骤、坑 → skill；环境事实/约定/教训与用户画像 → 记忆（规则见上）。'
@@ -742,7 +849,81 @@ function reviewPrompt(eff = {}) {
     '```',
     'patch 时 body 必须基于注入的目标全文修改（保留正确内容，只改需要改的），不得凭空重写。',
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
-  ].join('\n')
+  ],
+  en: (memoryOn) => [
+    'You are the background review agent: analyze a transcript of a just-finished conversation and decide whether it holds experience worth distilling into a skill.',
+    '',
+    '## Lean toward acting',
+    'Be ACTIVE — most conversations are worth at least one small update. Doing nothing is not a neutral outcome; it is a missed learning opportunity.',
+    '',
+    '## Positive signals (act if any holds)',
+    '1. The user corrected style/tone/format/verbosity ("stop doing X" / "too verbose" / "just give me the answer") — this is a FIRST-CLASS signal;',
+    '2. The user corrected the workflow or the order of steps;',
+    '3. A non-trivial technique, fix, workaround, debugging path, or tool usage appeared;',
+    '4. An injected existing skill was found wrong, incomplete, or outdated → PATCH it immediately.',
+    '',
+    '## Negative list (never distill these)',
+    '- Environment dependency failures (missing binary, unconfigured credentials — things the user can fix themselves);',
+    '- Negative assertions about tools ("X is broken" hardens into a permanent refusal);',
+    '- Transient errors already resolved within the session (what is worth storing is the retry pattern, not the failure itself);',
+    '- One-off task narrative (it does not constitute a category of work);',
+    '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
+    '',
+    '## Priority order',
+    '1. PATCH a skill that appeared in the transcript and whose full text was injected;',
+    '2. PATCH an existing class-level umbrella skill (see the catalog below);',
+    '3. Only when neither covers it, CREATE a new skill.',
+    '',
+    '## Naming discipline',
+    'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
+    'If the name only makes sense for today\'s task, it is wrong — go back to priority 1/2 and extend an existing skill instead.',
+    ...(memoryOn ? [
+      '',
+      '## Memory (optional conclusion — most reviews should produce none)',
+      'Besides skills, consider writing memory only when the conversation **explicitly** surfaced:',
+      '- user profile, preferences, expectations about how you behave → store="user";',
+      '- environment/project facts, conventions, lessons (e.g. "releases require OTP", "the service runs on port 19080") → store="memory";',
+      '- processes, steps, pitfalls → these remain skills; never write them into memory.',
+      'Produce on demand: if nothing is clearly worth keeping, omit the memory field — do not write for the sake of writing. The memory stores are small, tightly-curated lists; mediocre entries crowd out real ones, while a missed entry costs almost nothing.',
+      'When a store nears its limit, prefer replace (merge and rewrite an existing entry) or remove (drop a stale entry) over add.',
+      '',
+    ] : []),
+    '## Division of labour',
+    memoryOn
+      ? 'Processes, steps, pitfalls → skill; environment facts/conventions/lessons and user profile → memory (rules above).'
+      : 'Processes, steps, pitfalls → skill. User profile/preference information is not distilled this round.',
+    '',
+    '## Output protocol (strictly obey)',
+    'Output one fenced JSON code block and nothing else:',
+    '```json',
+    '{ "action": "nothing" | "create" | "patch",',
+    '  "skill": "kebab-case-name",            // required for create/patch',
+    '  "description": "≤500 characters",       // required for create',
+    '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
+    '  "baseHash": "<echo the injected suspect baseHash verbatim>",  // required for patch',
+    '  "baseDescription": "<echo the injected suspect description verbatim>",  // required for patch',
+    '  "rationale": "One sentence: why it is worth storing, or why not",',
+    ...(memoryOn ? [
+      '  "memory": {                            // optional; most reviews should omit the whole field',
+      '    "action": "nothing" | "add" | "replace" | "remove",',
+      '    "store": "memory" | "user",           // required for add/replace/remove',
+      '    "text": "New entry, one sentence (required for add/replace)",',
+      '    "oldText": "A substring of the original text that uniquely matches one entry in the memory list below (required for replace/remove)",',
+      '    "rationale": "Why record / change / delete" }',
+    ] : []),
+    '}',
+    '```',
+    'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
+    'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
+  ],
+}
+
+function reviewPrompt(eff = {}, lang) {
+  const memoryOn = MEMORY_STORES.some((s) => {
+    const enabled = s === 'user' ? eff.userProfileEnabled : eff.memoryEnabled
+    return enabled !== false
+  })
+  return REVIEW_PROMPT_TEXT[languageOf(lang)](memoryOn).join('\n')
 }
 
 
@@ -778,6 +959,9 @@ module.exports = {
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
     parseMemoryEntries, serializeMemoryEntries, scanMemoryEntry, planMemoryChange,
     applyMemoryConclusion, renderMemoryContext,
+    // Local fork surface.
+    reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
+    REVIEW_PROMPT_TEXT, MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
   },
 
   apply(ctx, config = {}) {
@@ -815,11 +999,34 @@ module.exports = {
 
     const effective = () => ({ ...base, ...liveSettings, ...memoryPatch })
 
+    // ── Local fork: language state, read from the shared settings document ────
+    // Same document and same describe() projection as the plugin's own
+    // namespace, so the Language row in Settings → General is the single
+    // source of truth. Cached because three surfaces read it per turn; the
+    // watcher below invalidates it. An unreadable document is retried rather
+    // than cached as zh, so a locale entry that mounts late still takes effect.
+    let languageCache = undefined
+    let languageRetries = 0
+    function language() {
+      if (languageCache === undefined) {
+        const read = readLocalePreference(ctx)
+        languageCache = read.seen ? languageOf(read.value) : undefined
+        if (!read.seen && !(languageRetries++ > 15)) {
+          setTimeout(() => { languageCache = undefined; language() }, 2000).unref?.()
+        }
+      }
+      return languageCache ?? DEFAULT_LANGUAGE
+    }
+    ctx.logger.info && ctx.logger.info(
+      `hermes-loop: review copy language ${language()} (settings ns=${LOCALE_SETTINGS_NS}; unset → ${DEFAULT_LANGUAGE})`)
+
     // settings 文档变更（dsh 自动生成的设置页、本插件面板写回）刷新实时值
     try {
       if (ctx.on && typeof ctx.on === 'function') {
         ctx.effect(() => {
           const off = ctx.on('settings/document-updated', (ns) => {
+            // locale changes too: the Language row writes through this same event.
+            if (ns === LOCALE_SETTINGS_NS) languageCache = undefined
             if (ns !== SETTINGS_NS) return
             const d = readDescriptor()
             if (d && d.value && typeof d.value === 'object') liveSettings = d.value
@@ -842,12 +1049,11 @@ module.exports = {
         ctx.effect(() => ctx.systemPrompt.section({
           name: 'hermes:loop-aware', // 与 hermes-prompt 的 hermes:discipline 不同名——同层同名抛错
           order: 51,
-          text: [
-            '# 收尾沉淀（后台学习循环在运行）',
-            '',
-            '- 收尾时若发现**本会话已加载的 skill** 有错、缺步骤或过时：直接用你的工具**当场修正它**，不要留到后台复盘（后台也会复盘，但当场修的上下文最全）。',
-            '- 其余沉淀（新 skill、经验教训）交给后台学习循环处理，**不要**主动写新 skill 文件——避免两套纪律打架。',
-          ].join('\n'),
+          // Local fork: a provider, not a static string, so a Language change
+          // takes effect on the next assembly instead of the next restart.
+          // Cost is confined to that rare event: only then does the request
+          // prefix change, which is exactly when a cache miss is expected.
+          text: () => LOOP_AWARE_TEXT[language()].join('\n'),
         }), 'hermes-loop: loop-aware section')
         ctx.logger.info && ctx.logger.info('hermes-loop: loop-aware section registered (hermes-prompt absent)')
       } else {
@@ -869,7 +1075,7 @@ module.exports = {
         try {
           return renderMemoryContext(effective(), (store) => {
             try { return fs.readFileSync(memoryStoreFile(store), 'utf8') } catch { return '' }
-          })
+          }, language())
         } catch (e) {
           // 读盘/渲染故障：本会话以空快照起步（宁可空不可错），限频告警防刷日志
           const nowMs = Date.now()
@@ -1187,18 +1393,22 @@ module.exports = {
         trace('review-agent-created', { reviewSession: agent.id })
 
         // 3.5 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
+        // Local fork: one language decision per review run, so the prompt, the
+        // memory block, and the section headings cannot disagree.
+        const lang = language()
         const memoryOn = MEMORY_STORES.some((s) => memoryStoreEnabled(s, eff))
         let memoryBlock = ''
         if (memoryOn) {
           const storeParts = []
+          const MT = REVIEW_MEMORY_BLOCK_TEXT[lang]
           for (const store of MEMORY_STORES) {
             if (!memoryStoreEnabled(store, eff)) continue
             let raw = ''
             try { raw = await fsP.readFile(memoryStoreFile(store), 'utf8') } catch { /* 新库 */ }
             const entries = parseMemoryEntries(raw)
-            storeParts.push(`### ${store === 'user' ? 'USER' : 'MEMORY'}（${entries.length} 条）\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : '（空）'}`)
+            storeParts.push(`### ${store === 'user' ? 'USER' : 'MEMORY'}（${entries.length} ${MT.items}）\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : MT.empty}`)
           }
-          memoryBlock = '\n## 当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）\n' + storeParts.join('\n\n')
+          memoryBlock = '\n## ' + MT.section + '\n' + storeParts.join('\n\n')
         }
 
         // 4. pump the final assistant message out of the session log
@@ -1227,7 +1437,7 @@ module.exports = {
                 liveText += chunk.text
                 if (running !== null && running.sessionId === sessionId) running.preview = liveText.slice(-1200)
               } else if (chunk.type === 'reasoning-delta' && chunk.text && (running !== null && running.sessionId === sessionId)) {
-                running.preview = '（推理中）' + chunk.text.slice(-1000)
+                running.preview = REVIEW_INPUT_TEXT[lang].reasoning + chunk.text.slice(-1000)
               }
             }
           }
@@ -1239,12 +1449,13 @@ module.exports = {
         const onAbort = () => { try { agent.cancel({ kind: 'parent' }) } catch {} }
         controller.signal.addEventListener('abort', onAbort, { once: true })
         try {
+          const IT = REVIEW_INPUT_TEXT[lang]
           const prompt = [
-            reviewPrompt(eff),
-            '\n## 既有 skill 清单（name: description）\n' + catalogText,
-            suspectBlocks.length > 0 ? '\n## 疑似相关 skill 全文\n' + suspectBlocks.join('\n\n---\n\n') : '',
+            reviewPrompt(eff, lang),
+            '\n## ' + IT.catalog + '\n' + catalogText,
+            suspectBlocks.length > 0 ? '\n## ' + IT.suspects + '\n' + suspectBlocks.join('\n\n---\n\n') : '',
             memoryBlock,
-            '\n## 会话转写（保尾截断）\n' + transcriptText,
+            '\n## ' + IT.transcript + '\n' + transcriptText,
           ].filter(Boolean).join('\n\n')
           agent.followup({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
           await agent.whenIdle()

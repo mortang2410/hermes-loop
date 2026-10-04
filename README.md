@@ -1,3 +1,12 @@
+# @local/hermes-loop-i18n
+
+> **本地分支**（fork of [weibaohui/hermes-loop](https://github.com/weibaohui/hermes-loop) v0.1.16, MIT）。
+> 唯一改动：宿主侧的复盘 prompt、长期记忆快照与收尾沉淀 section 改为**跟随 DSH 语言设置**
+> （读 settings 文档 `ns=locale` 的 `preference`）。未选择语言时行为与上游完全一致（中文）。
+> 改动全记录见 [FORK-NOTES.md](./FORK-NOTES.md)。
+
+---
+
 # @weibaohui/hermes-loop
 
 [![DSH plugin](https://img.shields.io/badge/dsh-plugin-green)](https://github.com/topics/dsh-plugin)

@@ -1,7 +1,7 @@
 {
-  "name": "@weibaohui/hermes-loop",
-  "version": "0.1.16",
-  "description": "dsh 插件 · 自动复盘：对话收尾后自动复盘，把有价值的经验蒸馏成可复用的技能（skill）存入技能库，模型可直接调用；同时把环境事实与用户偏好写入跨会话记忆（MEMORY.md / USER.md，首冻结注入每个对话）；支持信号加速触发、手动立即复盘、审批模式与技能库治理（归档/恢复，永不直接删除）。",
+  "name": "@local/hermes-loop-i18n",
+  "version": "0.1.16-i18n.1",
+  "description": "dsh 插件 · hermes-loop 本地分支（上游 weibaohui/hermes-loop 0.1.16）：宿主侧 review prompt、长期记忆快照与收尾沉淀 section 改为跟随 DSH 语言设置（读 settings 文档 ns=locale 的 preference），其余行为与上游一致。",
   "license": "MIT",
   "keywords": [
     "dsh",
@@ -11,7 +11,10 @@
     "skills",
     "hermes",
     "learning-loop",
-    "dsh-plugin"
+    "dsh-plugin",
+    "i18n",
+    "locale",
+    "localization"
   ],
   "main": "src/index.js",
   "exports": {
@@ -46,13 +49,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/weibaohui/hermes-loop.git"
+    "url": "git+https://github.com/weibaohui/hermes-loop.git (upstream; local fork in dsh-test/hermes-loop-i18n)"
   },
   "homepage": "https://github.com/weibaohui/hermes-loop#readme",
   "bugs": {
     "url": "https://github.com/weibaohui/hermes-loop/issues"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "restricted"
   }
 }
