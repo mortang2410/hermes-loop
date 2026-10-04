@@ -36,6 +36,9 @@
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4"
   },
+  "devDependencies": {
+    "@weibaohui/hermes-loop": "0.1.16"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
