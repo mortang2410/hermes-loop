@@ -60,19 +60,23 @@ const DESCRIPTION_MAX = 500
 // never inventing an English default the user never picked.
 const LOCALE_SETTINGS_NS = 'locale'
 const DEFAULT_LANGUAGE = 'zh'
+// ~30 s of retrying: long enough for the settings entry to mount behind us,
+// short enough that a profile which simply has no locale row stops paying for it.
+const LANGUAGE_RETRIES = 15
 
 /**
  * Read the durable locale preference out of the settings document.
  *
  * @param ctx Plugin context, used only for its `settings.describe` projection.
+ * @param {string} [namespace] Settings namespace to read; defaults to the locale one.
  * @returns {{ value: string|undefined, seen: boolean }} `seen` distinguishes a readable
  * document with no explicit preference from an unreadable one, so a settings
  * service that has not mounted yet is never mistaken for an unset preference.
  */
-function readLocalePreference(ctx, namespace) {
+function readLocalePreference(ctx, namespace = LOCALE_SETTINGS_NS) {
   try {
     if (!ctx.settings || typeof ctx.settings.describe !== 'function') return { value: undefined, seen: false }
-    const descriptor = ctx.settings.describe().find((row) => row.ns === LOCALE_SETTINGS_NS)
+    const descriptor = ctx.settings.describe().find((row) => row.ns === namespace)
     if (!descriptor) return { value: undefined, seen: false }
     const value = descriptor.value && typeof descriptor.value === 'object' ? descriptor.value.preference : undefined
     // An explicit, still-registered locale id; anything else is "no choice".
@@ -1032,11 +1036,23 @@ module.exports = {
     // than cached as zh, so a locale entry that mounts late still takes effect.
     let languageCache = undefined
     let languageRetries = 0
+    // scope(agent) → 该会话冻结快照时用的语言。记忆快照按会话首冻结，语言必须一起
+    // 冻结：否则 loop-aware section（每次 assemble 重读）会中途换语言，而已冻结的
+    // 快照仍是旧语言，同一会话出现两种语言。
+    const memoryLang = new WeakMap()
     function language() {
       if (languageCache === undefined) {
         const read = readLocalePreference(ctx)
-        languageCache = read.seen ? languageOf(read.value) : undefined
-        if (!read.seen && !(languageRetries++ > 15)) {
+        if (read.seen) {
+          languageCache = languageOf(read.value)
+        } else if (languageRetries++ > LANGUAGE_RETRIES) {
+          // Give up on an absent settings document and cache the conservative
+          // answer. Caching it matters: describe() walks every plugin row in the
+          // profile, and leaving the cache undefined would pay that cost on
+          // every prompt assembly forever. A later document-updated event still
+          // re-reads, so a locale row that mounts late is picked up.
+          languageCache = DEFAULT_LANGUAGE
+        } else {
           setTimeout(() => { languageCache = undefined; language() }, 2000).unref?.()
         }
       }
@@ -1051,7 +1067,7 @@ module.exports = {
         ctx.effect(() => {
           const off = ctx.on('settings/document-updated', (ns) => {
             // locale changes too: the Language row writes through this same event.
-            if (ns === LOCALE_SETTINGS_NS) languageCache = undefined
+            if (ns === LOCALE_SETTINGS_NS) { languageCache = undefined; languageRetries = 0 }
             if (ns !== SETTINGS_NS) return
             const d = readDescriptor()
             if (d && d.value && typeof d.value === 'object') liveSettings = d.value
@@ -1078,7 +1094,11 @@ module.exports = {
           // takes effect on the next assembly instead of the next restart.
           // Cost is confined to that rare event: only then does the request
           // prefix change, which is exactly when a cache miss is expected.
-          text: () => LOOP_AWARE_TEXT[language()].join('\n'),
+          text: (asmCtx) => {
+            const scope = asmCtx && typeof asmCtx === 'object' ? asmCtx.scope : undefined
+            const lang = (scope && memoryLang.get(scope)) || language()
+            return LOOP_AWARE_TEXT[lang].join('\n')
+          },
         }), 'hermes-loop: loop-aware section')
         ctx.logger.info && ctx.logger.info('hermes-loop: loop-aware section registered (hermes-prompt absent)')
       } else {
@@ -1096,11 +1116,11 @@ module.exports = {
     if (ctx.systemPrompt && typeof ctx.systemPrompt.context === 'function') {
       const memoryFreeze = new WeakMap() // scope(agent) → 会话首快照文本（可为 ''）
       const memoryWarn = { at: 0 }
-      const renderMemorySafe = () => {
+      const renderMemorySafe = (lang) => {
         try {
           return renderMemoryContext(effective(), (store) => {
             try { return fs.readFileSync(memoryStoreFile(store), 'utf8') } catch { return '' }
-          }, language())
+          }, lang)
         } catch (e) {
           // 读盘/渲染故障：本会话以空快照起步（宁可空不可错），限频告警防刷日志
           const nowMs = Date.now()
@@ -1118,11 +1138,13 @@ module.exports = {
           const scope = asmCtx && typeof asmCtx === 'object' ? asmCtx.scope : undefined
           if (scope && typeof scope === 'object') {
             if (memoryFreeze.has(scope)) return memoryFreeze.get(scope)
-            const text = renderMemorySafe()
+            const lang = language()
+            memoryLang.set(scope, lang)
+            const text = renderMemorySafe(lang)
             memoryFreeze.set(scope, text)
             return text
           }
-          return renderMemorySafe() // 无 scope（非常规调用/测试）：现算，不冻结
+          return renderMemorySafe(language()) // 无 scope（非常规调用/测试）：现算，不冻结
         },
       }), 'hermes-loop: memory context')
       ctx.logger.info && ctx.logger.info('hermes-loop: memory context registered (~/.dsh/memory/{MEMORY,USER}.md, frozen per session)')

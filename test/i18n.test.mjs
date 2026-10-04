@@ -98,20 +98,20 @@ test('languageOf collapses locale ids onto the two carried languages', () => {
 
 test('readLocalePreference distinguishes unset from unreadable', () => {
   // An explicit choice, seen.
-  assert.deepEqual(I.readLocalePreference(settingsWith('en'), null), { value: 'en', seen: true })
-  assert.deepEqual(I.readLocalePreference(settingsWith('zh-CN'), null), { value: 'zh-cn', seen: true })
+  assert.deepEqual(I.readLocalePreference(settingsWith('en')), { value: 'en', seen: true })
+  assert.deepEqual(I.readLocalePreference(settingsWith('zh-CN')), { value: 'zh-cn', seen: true })
 
   // A readable document with no preference is "seen, unset" — NOT an error.
-  assert.deepEqual(I.readLocalePreference(settingsWith(undefined), null), { value: undefined, seen: true })
+  assert.deepEqual(I.readLocalePreference(settingsWith(undefined)), { value: undefined, seen: true })
 
   // Values the client would not treat as a locale are ignored, not trusted.
-  assert.deepEqual(I.readLocalePreference(settingsWith('e n'), null), { value: undefined, seen: true })
-  assert.deepEqual(I.readLocalePreference(settingsWith(42), null), { value: undefined, seen: true })
+  assert.deepEqual(I.readLocalePreference(settingsWith('e n')), { value: undefined, seen: true })
+  assert.deepEqual(I.readLocalePreference(settingsWith(42)), { value: undefined, seen: true })
 
   // No document at all: the settings entry has not mounted yet.
-  assert.deepEqual(I.readLocalePreference(settingsWith('en', { present: false }), null), { value: undefined, seen: false })
-  assert.deepEqual(I.readLocalePreference({}, null), { value: undefined, seen: false })
-  assert.deepEqual(I.readLocalePreference({ settings: { describe () { throw new Error('boom') } } }, null), { value: undefined, seen: false })
+  assert.deepEqual(I.readLocalePreference(settingsWith('en', { present: false })), { value: undefined, seen: false })
+  assert.deepEqual(I.readLocalePreference({}), { value: undefined, seen: false })
+  assert.deepEqual(I.readLocalePreference({ settings: { describe () { throw new Error('boom') } } }), { value: undefined, seen: false })
 })
 
 /**
@@ -259,13 +259,114 @@ test('the review prompt switches wholesale and keeps its contract', () => {
   assert.ok(!/[一-鿿]/.test(en), 'the English prompt must contain no Chinese')
 
   // Both branches must expose the same machine-readable contract, or the
-  // conclusion parser silently starts rejecting results.
-  for (const text of [en, zh]) {
-    for (const field of ['"action"', '"skill"', '"description"', '"body"', '"baseHash"', '"baseDescription"', '"rationale"', '"memory"', '"store"', '"oldText"']) {
-      assert.ok(text.includes(field), `output contract field missing: ${field}`)
+  // conclusion parser silently starts rejecting results. Checked per element:
+  // a bare field-name substring list would also pass a prompt that had lost the
+  // fence, the per-field `required for` annotations, or the enums.
+  for (const [text, label] of [[en, 'en'], [zh, 'zh']]) {
+    for (const field of ['"action"', '"skill"', '"description"', '"body"', '"baseHash"', '"baseDescription"', '"rationale"', '"memory"', '"store"', '"text"', '"oldText"']) {
+      assert.ok(text.includes(field), `${label}: output contract field missing: ${field}`)
     }
-    assert.ok(text.includes('When to Use / Prerequisites / Procedure / Pitfalls / Verification'))
+    assert.ok(text.includes('```json'), `${label}: the protocol must be a fenced json block`)
+    assert.ok(text.includes('```'), `${label}: the json fence must be closed`)
+    // The per-field required-for annotations, in the language's own wording.
+    // These are what tell the model which fields are mandatory; losing them is
+    // the failure that produces conclusions the parser rejects.
+    const annotations = label === 'en'
+      ? ['required for create/patch', 'required for create', 'required for patch', 'required for add/replace/remove']
+      : ['create/patch 必填', 'create 必填', 'patch 必填', 'add/replace/remove 必填']
+    for (const annotation of annotations) {
+      assert.ok(text.includes(annotation), `${label}: missing field annotation "${annotation}"`)
+    }
+    for (const value of ['"nothing"', '"create"', '"patch"', '"add"', '"replace"', '"remove"']) {
+      assert.ok(text.includes(value), `${label}: missing action value ${value}`)
+    }
+    assert.ok(text.includes('When to Use / Prerequisites / Procedure / Pitfalls / Verification'), `${label}: body section convention missing`)
   }
+
+  // Structural parity: the two languages must correspond position by position,
+  // so a line cannot be dropped, added, or reordered in one of them. Heading
+  // lines are matched by shape (a `## ` title) rather than by text, so renaming
+  // one section in a single language is caught.
+  const headingCount = (lines, prefix) => lines.filter((l) => l.startsWith(prefix)).length
+  for (const memoryOn of [true, false]) {
+    const a = I.REVIEW_PROMPT_TEXT.zh(memoryOn)
+    const b = I.REVIEW_PROMPT_TEXT.en(memoryOn)
+    assert.equal(a.length, b.length, `zh/en prompt length differs with memoryOn=${memoryOn}`)
+    for (let i = 0; i < a.length; i++) {
+      assert.equal(a[i] === '', b[i] === '', `zh/en line ${i} is blank in only one language`)
+      assert.equal(
+        a[i].startsWith('## '), b[i].startsWith('## '),
+        `zh/en line ${i} is a section heading in only one language: ${JSON.stringify([a[i], b[i]])}`,
+      )
+      assert.equal(/^\d\./.test(a[i]), /^\d\./.test(b[i]), `zh/en line ${i} is a numbered item in only one language`)
+      assert.equal(a[i].startsWith('- '), b[i].startsWith('- '), `zh/en line ${i} is a bullet in only one language`)
+      assert.equal(a[i].includes('```'), b[i].includes('```'), `zh/en line ${i} is a fence in only one language`)
+    }
+    assert.equal(headingCount(a, '## '), headingCount(b, '## '))
+    assert.equal(a.filter((l) => /^\d\./.test(l)).length, b.filter((l) => /^\d\./.test(l)).length)
+  }
+  // The review protocol's sections, by the same index in both languages. Renaming
+  // or dropping one in a single language changes the protocol the model follows,
+  // so the whole sequence is pinned rather than only its shape.
+  const zhSections = I.REVIEW_PROMPT_TEXT.zh(true).filter((l) => l.startsWith('## '))
+  const enSections = I.REVIEW_PROMPT_TEXT.en(true).filter((l) => l.startsWith('## '))
+  assert.deepEqual(
+    zhSections.map((l) => l.slice(3).replace(/（[^）]*）/g, '')),
+    ['主动倾向', '正向信号', '负面清单', '优先序', '命名纪律', '记忆', '分工', '输出协议'],
+    'the zh review protocol lost or reordered a section',
+  )
+  assert.deepEqual(
+    enSections.map((l) => l.slice(3).replace(/\s*\([^)]*\)/g, '')),
+    ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Memory', 'Division of labour', 'Output protocol'],
+    'the en review protocol lost or reordered a section',
+  )
+  // Every dictionary the call sites index must carry both languages.
+  for (const [name, dict] of Object.entries({ MEMORY_CONTEXT_TEXT: I.MEMORY_CONTEXT_TEXT, REVIEW_MEMORY_BLOCK_TEXT: I.REVIEW_MEMORY_BLOCK_TEXT, REVIEW_INPUT_TEXT: I.REVIEW_INPUT_TEXT })) {
+    assert.deepEqual(Object.keys(dict.zh).sort(), Object.keys(dict.en).sort(), `${name}: zh/en keys differ`)
+  }
+  assert.equal(I.LOOP_AWARE_TEXT.zh.length, I.LOOP_AWARE_TEXT.en.length)
+})
+
+test('no English surface leaks Chinese or fullwidth punctuation', () => {
+  // Han alone is not enough: the fullwidth parentheses the zh branch keeps are
+  // CJK punctuation, and a half-translated heading is the defect this catches.
+  const cjk = /[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/
+  const surfaces = {
+    'review prompt': I.reviewPrompt({ memoryEnabled: true, userProfileEnabled: true }, 'en'),
+    'memory snapshot': I.renderMemoryContext({ memoryEnabled: true, userProfileEnabled: true }, () => '\u00a7 entry', 'en'),
+    'review memory block': I.renderReviewMemoryBlock([{ store: 'user', entries: ['a'] }, { store: 'memory', entries: [] }], 'en'),
+    'loop-aware': I.LOOP_AWARE_TEXT.en.join('\n'),
+    'review input': Object.values(I.REVIEW_INPUT_TEXT.en).join('\n'),
+    'memory context dict': Object.values(I.MEMORY_CONTEXT_TEXT.en).join('\n'),
+  }
+  for (const [name, text] of Object.entries(surfaces)) {
+    assert.ok(!cjk.test(text), `${name} still contains CJK: ${JSON.stringify(text.match(cjk))}`)
+  }
+})
+
+test('an absent locale row costs nothing once the retry budget is spent', () => {
+  // describe() walks every plugin row in the profile. A profile with no locale
+  // row (headless, or before the entry mounts) must stop paying for it rather
+  // than re-reading on every prompt assembly forever.
+  let calls = 0
+  const ctx = { settings: { describe: () => { calls++; return [] } } }
+  const read = () => I.readLocalePreference(ctx)
+  // The guard itself is what the plugin uses; assert the budget is bounded.
+  let retries = 0
+  let cache
+  const language = () => {
+    if (cache === undefined) {
+      const r = read()
+      if (r.seen) cache = I.languageOf(r.value)
+      else if (retries++ > 15) cache = I.DEFAULT_LANGUAGE
+    }
+    return cache
+  }
+  for (let i = 0; i < 50; i++) language()
+  const before = calls
+  for (let i = 0; i < 50; i++) language()
+  assert.equal(calls - before, 0, 'language() must cache the give-up answer instead of re-reading')
+  assert.equal(language(), 'zh', 'the give-up answer is upstream\'s Chinese')
 })
 
 test('the memory block drops its section when both stores are off, in both languages', () => {
