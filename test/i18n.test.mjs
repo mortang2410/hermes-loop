@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -23,7 +23,13 @@ const { __internals: I } = fork
 // require with one appended export line rather than re-deriving its behaviour
 // from its text. `createRequire` keeps this CommonJS-safe even though this test
 // file is an ES module.
-const UPSTREAM = '/home/wilder/.dsh/profiles/web/node_modules/@weibaohui/hermes-loop/src/index.js'
+//
+// Resolved from node_modules so the oracle travels with the checkout instead of
+// pointing at one developer's dsh profile: if the package is not installed the
+// parity tests skip rather than silently passing against nothing.
+const UPSTREAM = join(root, 'node_modules', '@weibaohui', 'hermes-loop', 'src', 'index.js')
+const haveUpstream = existsSync(UPSTREAM)
+const oracle = { skip: haveUpstream ? false : '@weibaohui/hermes-loop is not installed' }
 
 function loadUpstream() {
   const source = readFileSync(UPSTREAM, 'utf8').replace(
@@ -37,7 +43,11 @@ function loadUpstream() {
   return module_.exports.__internals
 }
 
-const U = loadUpstream()
+// Lazy, so a checkout without the oracle skips instead of failing at import.
+let U
+function upstream() {
+  return (U ??= loadUpstream())
+}
 
 /** Every zh dictionary value must be text upstream actually wrote. */
 function upstreamSource() {
@@ -84,7 +94,7 @@ test('readLocalePreference distinguishes unset from unreadable', () => {
   assert.deepEqual(I.readLocalePreference({ settings: { describe () { throw new Error('boom') } } }, null), { value: undefined, seen: false })
 })
 
-test('the default language is upstream 0.1.16, verified by running upstream', () => {
+test('the default language is upstream 0.1.16, verified by running upstream', oracle, () => {
   // The load-bearing assertion: with no preference recorded, this fork must
   // produce exactly what the package it replaces produced. Comparing against
   // upstream's own function catches any drift in the zh branch itself.
@@ -95,19 +105,19 @@ test('the default language is upstream 0.1.16, verified by running upstream', ()
     { memoryEnabled: false, userProfileEnabled: false },
     {},
   ]) {
-    assert.equal(I.reviewPrompt(eff), U.reviewPrompt(eff), `fork zh drifted from upstream for ${JSON.stringify(eff)}`)
-    assert.equal(I.reviewPrompt(eff, 'zh'), U.reviewPrompt(eff))
+    assert.equal(I.reviewPrompt(eff), upstream().reviewPrompt(eff), `fork zh drifted from upstream for ${JSON.stringify(eff)}`)
+    assert.equal(I.reviewPrompt(eff, 'zh'), upstream().reviewPrompt(eff))
   }
 
   // Also pin the memory snapshot, which is the surface injected into every
   // session's context rather than only into the review agent.
   const eff = { memoryEnabled: true, userProfileEnabled: true, memoryCharLimit: 2200, userCharLimit: 1375 }
   const readRaw = (store) => (store === 'user' ? '§ 偏好：直接给答案' : '§ 端口是 3080')
-  assert.equal(I.renderMemoryContext(eff, readRaw), U.renderMemoryContext(eff, readRaw))
-  assert.equal(I.renderMemoryContext(eff, readRaw, 'zh'), U.renderMemoryContext(eff, readRaw))
+  assert.equal(I.renderMemoryContext(eff, readRaw), upstream().renderMemoryContext(eff, readRaw))
+  assert.equal(I.renderMemoryContext(eff, readRaw, 'zh'), upstream().renderMemoryContext(eff, readRaw))
 
   // And assert undefined explicitly means zh, so no caller needs a sentinel.
-  assert.equal(I.reviewPrompt({}), U.reviewPrompt({}))
+  assert.equal(I.reviewPrompt({}), upstream().reviewPrompt({}))
 
   // No fork-only Chinese may exist in the dictionaries: each zh value must be
   // text upstream's own source contains, verbatim. Substring, not a parsed
