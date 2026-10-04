@@ -631,9 +631,11 @@ const MEMORY_CONTEXT_TEXT = {
   },
 }
 
+// 括号也是复述文案的一部分：上游把全角「（）」直接写在模板里，en 分支若沿用全角，
+// 就会在纯英文复盘输入里留下唯一的 CJK 字符。zh 保持上游全角不动。
 const REVIEW_MEMORY_BLOCK_TEXT = {
-  zh: { section: '当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）', items: '条', empty: '（空）' },
-  en: { section: 'Current memory entries (oldText must match exactly one entry\'s original text; omit the memory field entirely when nothing is worth recording)', items: 'entries', empty: '(empty)' },
+  zh: { section: '当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）', items: '条', open: '（', close: '）', empty: '（空）' },
+  en: { section: 'Current memory entries (oldText must match exactly one entry\'s original text; omit the memory field entirely when nothing is worth recording)', items: 'entries', open: ' (', close: ')', empty: '(empty)' },
 }
 
 const LOOP_AWARE_TEXT = {
@@ -657,12 +659,16 @@ const REVIEW_INPUT_TEXT = {
     suspects: '疑似相关 skill 全文',
     transcript: '会话转写（保尾截断）',
     reasoning: '（推理中）',
+    emptyCatalog: '（当前无可用 skill）',
+    truncated: '\n…（截断）',
   },
   en: {
     catalog: 'Existing skill catalog (name: description)',
     suspects: 'Full text of likely-relevant skills',
     transcript: 'Session transcript (tail-preserving truncation)',
     reasoning: '(reasoning)',
+    emptyCatalog: '(no skills available)',
+    truncated: '\n… (truncated)',
   },
 }
 
@@ -926,6 +932,25 @@ function reviewPrompt(eff = {}, lang) {
   return REVIEW_PROMPT_TEXT[languageOf(lang)](memoryOn).join('\n')
 }
 
+/**
+ * Render the "current memory entries" block injected into a review run.
+ *
+ * Split out of the review runner so the zh output can be compared against the
+ * template upstream writes inline, which is the only place the count's spacing
+ * and full-width parentheses are pinned.
+ *
+ * @param {Array<{store: string, entries: string[]}>} stores Enabled stores in render order.
+ * @param {string} [lang]
+ * @returns {string} The block, or '' when no store is enabled.
+ */
+function renderReviewMemoryBlock(stores, lang) {
+  const MT = REVIEW_MEMORY_BLOCK_TEXT[languageOf(lang)]
+  if (stores.length === 0) return ''
+  const storeParts = stores.map(({ store, entries }) =>
+    `### ${store === 'user' ? 'USER' : 'MEMORY'}${MT.open}${entries.length} ${MT.items}${MT.close}\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : MT.empty}`)
+  return '\n## ' + MT.section + '\n' + storeParts.join('\n\n')
+}
+
 
 // 0.1.7 宿主 resolveConfig 会把 apply-config 里的 volatile 字段物化成 {}（实测）：
 // {} 会盖掉 DEFAULTS，导致 describe 就绪前/降级路径下拿到毒化值。这里只保留
@@ -958,7 +983,7 @@ module.exports = {
     settingsSchema, Config,
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
     parseMemoryEntries, serializeMemoryEntries, scanMemoryEntry, planMemoryChange,
-    applyMemoryConclusion, renderMemoryContext,
+    applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
     // Local fork surface.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
     REVIEW_PROMPT_TEXT, MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
@@ -1344,6 +1369,10 @@ module.exports = {
 
       let handle
       try {
+        // One language decision per review run, so the catalog fallback, the
+        // truncation marker, the memory block, the prompt, and the input
+        // headings cannot disagree.
+        const lang = language()
         // 1. transcript tail
         const messages = session.deriveMessages()
         const transcriptText = renderTranscript(messages, eff)
@@ -1360,7 +1389,7 @@ module.exports = {
           }))
         const catalogText = catalog.length > 0
           ? catalog.map((s) => `- ${s.name}: ${s.description}`).join('\n')
-          : '（当前无可用 skill）'
+          : REVIEW_INPUT_TEXT[lang].emptyCatalog
         const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
         trace('review-inputs', { sessionId, messages: messages.length, catalogSize: catalog.length, suspects: suspects.map((s) => s.name) })
         const suspectBlocks = []
@@ -1374,7 +1403,7 @@ module.exports = {
           let content
           try { content = await fsP.readFile(file, 'utf8') } catch { continue }
           const hash = sha256(content)
-          if (content.length > SUSPECT_BODY_MAX_CHARS) content = content.slice(0, SUSPECT_BODY_MAX_CHARS) + '\n…（截断）'
+          if (content.length > SUSPECT_BODY_MAX_CHARS) content = content.slice(0, SUSPECT_BODY_MAX_CHARS) + REVIEW_INPUT_TEXT[lang].truncated
           // baseDescription 必须取文件全文里的完整值：目录构造时 description 被截断到
           // catalogDescriptionMax，用截断值做 CAS 基准会让长描述技能永远 cas-conflict
           suspectBlocks.push(`### suspect: ${suspect.name}\nbaseHash: ${hash}\nbaseDescription: ${JSON.stringify(descriptionOf(content) || '')}\n\n${content}`)
@@ -1393,22 +1422,17 @@ module.exports = {
         trace('review-agent-created', { reviewSession: agent.id })
 
         // 3.5 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
-        // Local fork: one language decision per review run, so the prompt, the
-        // memory block, and the section headings cannot disagree.
-        const lang = language()
         const memoryOn = MEMORY_STORES.some((s) => memoryStoreEnabled(s, eff))
         let memoryBlock = ''
         if (memoryOn) {
-          const storeParts = []
-          const MT = REVIEW_MEMORY_BLOCK_TEXT[lang]
+          const stores = []
           for (const store of MEMORY_STORES) {
             if (!memoryStoreEnabled(store, eff)) continue
             let raw = ''
             try { raw = await fsP.readFile(memoryStoreFile(store), 'utf8') } catch { /* 新库 */ }
-            const entries = parseMemoryEntries(raw)
-            storeParts.push(`### ${store === 'user' ? 'USER' : 'MEMORY'}（${entries.length} ${MT.items}）\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : MT.empty}`)
+            stores.push({ store, entries: parseMemoryEntries(raw) })
           }
-          memoryBlock = '\n## ' + MT.section + '\n' + storeParts.join('\n\n')
+          memoryBlock = renderReviewMemoryBlock(stores, lang)
         }
 
         // 4. pump the final assistant message out of the session log
