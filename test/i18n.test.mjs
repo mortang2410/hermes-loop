@@ -1,11 +1,11 @@
 /**
- * Local fork tests: the review prompt, the memory snapshot, and the loop-aware
+ * Locale tests: the review prompt, the memory snapshot, and the loop-aware
  * section follow the durable locale preference, and an unset preference is
  * byte-identical to upstream 0.1.16.
  *
  * The "byte-identical" assertions are the load-bearing ones. They are what
- * makes the fork safe to install for a user who never touches Settings →
- * Language: it must behave exactly like the package it replaces.
+ * makes the change safe for a user who never touches Settings → Language:
+ * they must get exactly the behaviour of the version this replaces.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -15,10 +15,10 @@ import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-const fork = createRequire(import.meta.url)(join(root, 'src/index.js'))
-const { __internals: I } = fork
+const plugin = createRequire(import.meta.url)(join(root, 'src/index.js'))
+const { __internals: I } = plugin
 
-// The pristine upstream copy this fork was cut from, used as the oracle. Its
+// The pristine copy of the version under test, used as the oracle. Its
 // reviewPrompt is not exported, so the source is evaluated through a CommonJS
 // require with one appended export line rather than re-deriving its behaviour
 // from its text. `createRequire` keeps this CommonJS-safe even though this test
@@ -58,7 +58,7 @@ function upstream() {
  * ~100 KB of Chinese, so a wrong one-character value ("字" instead of "条",
  * "个", "·") is a substring too, and the check passes on a wrong value. This
  * reads the enclosing string literal out of upstream's own text, so the
- * expected value comes from upstream rather than from the fork.
+ * expected value comes from the version under test rather than from here.
  */
 function upstreamLiteral(anchor, what) {
   const source = readFileSync(UPSTREAM, 'utf8')
@@ -119,7 +119,7 @@ test('readLocalePreference distinguishes unset from unreadable', () => {
  *
  * Upstream inlines this array inside `apply`, so there is no exported function
  * to call. Parsing the literal out of upstream's own text is still a real check:
- * it compares the fork's array against the array upstream ships, element by
+ * it compares this array against the one that version ships, element by
  * element, rather than merely confirming that each line appears somewhere.
  */
 function upstreamLoopAware() {
@@ -131,7 +131,7 @@ function upstreamLoopAware() {
 }
 
 test('the default language is upstream 0.1.16, verified by running upstream', oracle, () => {
-  // The load-bearing assertion: with no preference recorded, this fork must
+  // The load-bearing assertion: with no preference recorded, this change must
   // produce exactly what the package it replaces produced. Comparing against
   // upstream's own function catches any drift in the zh branch itself.
   for (const eff of [
@@ -141,7 +141,7 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     { memoryEnabled: false, userProfileEnabled: false },
     {},
   ]) {
-    assert.equal(I.reviewPrompt(eff), upstream().reviewPrompt(eff), `fork zh drifted from upstream for ${JSON.stringify(eff)}`)
+    assert.equal(I.reviewPrompt(eff), upstream().reviewPrompt(eff), `zh output drifted from upstream for ${JSON.stringify(eff)}`)
     assert.equal(I.reviewPrompt(eff, 'zh'), upstream().reviewPrompt(eff))
   }
 
@@ -163,7 +163,7 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     assert.equal(
       I.renderMemoryContext(eff, readRaw),
       upstream().renderMemoryContext(eff, readRaw),
-      `fork zh memory snapshot drifted from upstream: ${label}`,
+      `memory snapshot drifted from upstream: ${label}`,
     )
     assert.equal(I.renderMemoryContext(eff, readRaw, 'zh'), upstream().renderMemoryContext(eff, readRaw))
   }
@@ -174,13 +174,13 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   // The loop-aware section is injected into every session's system prompt and
   // upstream does not export it, so compare against the array it assembles —
   // read back out of upstream's source, not asserted as a substring of it.
-  assert.deepEqual(I.LOOP_AWARE_TEXT.zh, upstreamLoopAware(), 'fork zh loop-aware section drifted from upstream')
+  assert.deepEqual(I.LOOP_AWARE_TEXT.zh, upstreamLoopAware(), 'loop-aware section drifted from the version under test')
   assert.equal(I.LOOP_AWARE_TEXT.zh.join('\n'), upstreamLoopAware().join('\n'))
 
   // Every remaining zh value is compared against the literal at the exact
   // upstream site that uses it, so a wrong one-character value cannot pass.
   const inUpstream = (actual, anchor, what) =>
-    assert.equal(actual, upstreamLiteral(anchor, what), `not upstream's text — ${what}`)
+    assert.equal(actual, upstreamLiteral(anchor, what), `not the text of the version under test — ${what}`)
   inUpstream(I.REVIEW_INPUT_TEXT.zh.emptyCatalog, '（当前无可用 skill）', 'empty-catalog fallback')
   inUpstream(I.REVIEW_INPUT_TEXT.zh.truncated, '…（截断）', 'suspect truncation marker')
   inUpstream(I.MEMORY_CONTEXT_TEXT.zh.heading, '# 长期记忆（跨会话持久', 'memory snapshot heading')
@@ -224,7 +224,7 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     upstreamLiteral('## 当前记忆条目（oldText', 'memory block')
     + '### USER（2 条）\n§ a\n§ b\n\n'
     + '### MEMORY（0 条）\n（空）',
-    'fork zh review memory block drifted from the template upstream writes',
+    'review memory block drifted from the template upstream writes',
   )
   assert.ok(
     readFileSync(UPSTREAM, 'utf8').includes('}（${entries.length} 条）'),

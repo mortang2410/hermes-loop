@@ -44,7 +44,11 @@ let Schema = loadSchemastery()
 const KEbab_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const DESCRIPTION_MAX = 500
 
-// ── Local fork: language follows the DSH locale preference (route A) ─────────
+// ── Locale-aware copy ─────────────────────────────────────────────────────
+//
+// The review prompt, the long-term-memory snapshot and the loop-aware section
+// are model-facing, so their language belongs to the user's locale preference
+// rather than to a hard-coded choice.
 //
 // Upstream hard-codes Chinese into three model-facing surfaces (review prompt,
 // long-term-memory snapshot, loop-aware section). dsh ships no cross-plane
@@ -56,7 +60,7 @@ const DESCRIPTION_MAX = 500
 // Absence is the tricky half: an unset `preference` does NOT mean English.
 // The client falls back to browser detection (LocaleRuntime.resolveActive),
 // which the host cannot see. We therefore read the same durable document the
-// client reads and honour absence as "no explicit choice" → upstream Chinese,
+// client reads and honour absence as "no explicit choice" → the historical text,
 // never inventing an English default the user never picked.
 const LOCALE_SETTINGS_NS = 'locale'
 const DEFAULT_LANGUAGE = 'zh'
@@ -88,7 +92,7 @@ function readLocalePreference(ctx, namespace = LOCALE_SETTINGS_NS) {
 }
 
 /**
- * Collapse a locale id onto the languages this fork carries dictionaries for.
+ * Collapse a locale id onto the languages this plugin carries dictionaries for.
  *
  * @param {string} [value] A locale id such as `en`, `zh-CN`, or `zh-Hans-CN`.
  * @returns {'zh'|'en'} `zh` whenever the id is absent or does not start with `en`.
@@ -613,11 +617,11 @@ async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enab
   return { result: plan.result, store, chars: plan.chars, entries: plan.entries.length, limit }
 }
 
-// ── Local fork: model-facing copy, one entry per supported language ────────
+// ── Model-facing copy, one entry per supported language ─────────────────────
 //
 // zh entries are upstream's literals verbatim, so an unset preference produces
-// byte-identical output to 0.1.16 and the fork is a no-op until the user picks
-// a language in Settings → Language. `en` is the fork's whole contribution.
+// byte-identical output to 0.1.16, so this is a no-op until the user picks a
+// language in Settings → Language.
 const MEMORY_CONTEXT_TEXT = {
   zh: {
     heading: '# 长期记忆（跨会话持久，后台复盘按需维护；以下为最新全量快照）',
@@ -681,8 +685,8 @@ const REVIEW_INPUT_TEXT = {
  * 本函数只做渲染：两库全空/全关返回 ''（renderContextSections 会过滤空文本，快照整体
  * 不出现）。库里容错：单库读取失败按空库渲染，不让一次 IO 故障扩散。
  *
- * 本地分支：lang 选字典（'zh' 保持上游原文，'en' 走英文表）。条目正文是用户/复盘
- * 自己写的，不翻译——只翻译本函数生成的框架文字。
+ * lang 选字典（'zh' 保持历史原文，'en' 走英文表）。条目正文是用户/复盘自己写的，
+ * 不翻译——只翻译本函数生成的框架文字。
  */
 function renderMemoryContext(eff, readRaw, lang) {
   const T = MEMORY_CONTEXT_TEXT[languageOf(lang)]
@@ -791,8 +795,8 @@ function curatorTransitions(records, usage, { now, staleDays, archiveDays }) {
 // ── Review prompt (ported from Hermes _SKILL_REVIEW_PROMPT, design §4) ──
 // memory 增补段只在任一记忆库启用时出现（§12.3：两开关全关 = 协议退回 skill 单结论）。
 //
-// 本地分支：按 lang 取整段协议文本。结构、信号清单、负面清单与 JSON 字段名逐行对齐——
-// 只换语言，不换语义，否则复盘 agent 的判定行为会随语言漂移。
+// 按 lang 取整段协议文本。结构、信号清单、负面清单与 JSON 字段名逐行对齐——只换
+// 语言，不换语义，否则复盘 agent 的判定行为会随语言漂移。
 const REVIEW_PROMPT_TEXT = {
   zh: (memoryOn) => [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
@@ -988,7 +992,7 @@ module.exports = {
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
     parseMemoryEntries, serializeMemoryEntries, scanMemoryEntry, planMemoryChange,
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
-    // Local fork surface.
+    // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
     REVIEW_PROMPT_TEXT, MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
   },
@@ -1028,7 +1032,7 @@ module.exports = {
 
     const effective = () => ({ ...base, ...liveSettings, ...memoryPatch })
 
-    // ── Local fork: language state, read from the shared settings document ────
+    // ── Language state, read from the shared settings document ───────────────
     // Same document and same describe() projection as the plugin's own
     // namespace, so the Language row in Settings → General is the single
     // source of truth. Cached because three surfaces read it per turn; the
@@ -1090,10 +1094,10 @@ module.exports = {
         ctx.effect(() => ctx.systemPrompt.section({
           name: 'hermes:loop-aware', // 与 hermes-prompt 的 hermes:discipline 不同名——同层同名抛错
           order: 51,
-          // Local fork: a provider, not a static string, so a Language change
-          // takes effect on the next assembly instead of the next restart.
-          // Cost is confined to that rare event: only then does the request
-          // prefix change, which is exactly when a cache miss is expected.
+          // A provider, not a static string, so a Language change takes effect on
+          // the next assembly instead of the next restart. The text lives in the
+          // request prefix, so changing it costs a cache miss — expected on the
+          // rare turn where the user actually changed the language.
           text: (asmCtx) => {
             const scope = asmCtx && typeof asmCtx === 'object' ? asmCtx.scope : undefined
             const lang = (scope && memoryLang.get(scope)) || language()
