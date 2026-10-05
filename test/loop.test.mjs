@@ -172,14 +172,17 @@ function fakeServices(conclusionText, { agentSkills } = {}) {
   // An earlier fixture modelled two contexts with independent switches, which is
   // a state the host cannot produce (found in review round 2).
   //
-  // The review agent's ctx carries the full catalog; a plugin's own `ctx.skills`
-  // resolves only to its include subtree's sibling registrations. `tools` is
-  // present because `setup` always calls `agentCtx.tools.restrict`.
+  // The context is ALWAYS attached, even when it carries no skills service: the
+  // host always mints one, so "context exists, `get('skills')` returns undefined"
+  // is the real no-service shape. Leaving `agent.ctx` unset instead modelled a
+  // context-less agent that the host never produces (found in review round 3).
+  //
+  // `tools` is present because `setup` always calls `agentCtx.tools.restrict`.
   const agentCtx = {
     get: (name) => (name === 'skills' ? agentSkills : undefined),
     tools: { restrict() {} },
   }
-  if (agentSkills !== undefined) agent.ctx = agentCtx
+  agent.ctx = agentCtx
   return {
     created,
     agent,
@@ -1223,9 +1226,18 @@ test('review fix: an incomplete catalog withholds a skill conclusion but keeps m
       rationale: 'r',
       memory: { action: 'add', store: 'memory', text: 'the port is 3080', rationale: 'r' },
     })
-    const services = fakeServices('```json\n' + conclusion + '\n```')
+    const services = fakeServices('```json\n' + conclusion + '\n```', {
+      // Agent-scoped AND explicitly incomplete, so `catalogVia` is 'agent-ctx'
+      // and `complete: false` is the ONLY reason the catalog counts as short.
+      // Routing this through the plugin ctx instead would make the assertion
+      // pass on the `plugin-ctx` arm alone, leaving `complete` untested (found
+      // in review round 3).
+      agentSkills: catalogService([{ name: 'partial-skill', description: 'd', invocation: { modelInvocable: true } }], false),
+    })
+    // The plugin ctx answers with a COMPLETE catalogue, so if the agent-scoped
+    // read were skipped the guard would not fire and the skill would be written.
     services.skills = {
-      snapshot: async () => ({ skills: [{ name: 'partial-skill', description: 'd', invocation: { modelInvocable: true } }], complete: false }),
+      snapshot: async () => ({ skills: [], complete: true }),
     }
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
     const session = { id: 'session-incomplete', header: {}, deriveMessages: () => [{ role: 'user', content: 'deploy' }] }
@@ -1244,6 +1256,8 @@ test('review fix: an incomplete catalog withholds a skill conclusion but keeps m
     const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
       .trim().split('\n').map((l) => JSON.parse(l))
     const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogVia, 'agent-ctx', 'this case must exercise the agent-scoped route')
+    assert.equal(inputs.catalogComplete, false, 'the snapshot itself must report incomplete')
     assert.equal(inputs.catalogShorted, true, 'the trace must flag the short catalog')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
@@ -1262,8 +1276,9 @@ test('review fix: a host with no agent-scoped skills service falls back and says
   process.env.DSH_HOME = home
   try {
     const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```')
-    // Hide the service from BOTH routes: no agent-scoped skills at all.
-    delete services.agent.ctx
+    // No agentSkills supplied, so the context exists but carries no skills
+    // service: the host's real no-service shape. Do NOT delete `agent.ctx`; a
+    // context-less agent is a state the host does not produce.
     services.skills = {
       snapshot: async () => ({ skills: [{ name: 'only-skill', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
     }
