@@ -239,14 +239,15 @@ test('the memory snapshot renders in the chosen language', () => {
   const en = I.renderMemoryContext(eff, readRaw, 'en')
   const zh = I.renderMemoryContext(eff, readRaw, 'zh')
 
-  assert.match(en, /^# Long-term memory/)
-  assert.match(en, /## USER \(user profile \/ preferences\)/)
-  assert.match(en, /## MEMORY \(environment facts/)
-  assert.match(en, /1 entries/)
+  assert.ok(en.startsWith(I.MEMORY_CONTEXT_TEXT.en.heading), 'the English heading must be the one the dictionary carries')
+  assert.ok(en.includes(`## ${I.MEMORY_CONTEXT_TEXT.en.userTitle}`), 'the English user title must be the one the dictionary carries')
+  assert.ok(en.includes(`## ${I.MEMORY_CONTEXT_TEXT.en.memoryTitle}`), 'the English memory title must be the one the dictionary carries')
+  assert.ok(en.includes(`1 ${I.MEMORY_CONTEXT_TEXT.en.items}`), 'the English entry count must use the dictionary label')
+  assert.ok(en.includes(`2200 ${I.MEMORY_CONTEXT_TEXT.en.chars}`), 'the English char count must use the dictionary label')
   assert.ok(en.includes('服务跑在 3080 端口'), 'entry text must survive untouched')
 
   assert.match(zh, /^# 长期记忆/)
-  assert.match(zh, /1 条/)
+  assert.ok(zh.includes(`1 ${I.MEMORY_CONTEXT_TEXT.zh.items}`), 'the zh count must use the dictionary label')
 })
 
 test('the review prompt switches wholesale and keeps its contract', () => {
@@ -325,6 +326,39 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     assert.deepEqual(Object.keys(dict.zh).sort(), Object.keys(dict.en).sort(), `${name}: zh/en keys differ`)
   }
   assert.equal(I.LOOP_AWARE_TEXT.zh.length, I.LOOP_AWARE_TEXT.en.length)
+
+  // The English copy is pinned exactly. The zh copy is pinned against the version
+  // under test by running its code; there is no upstream English to compare with,
+  // so an English string can only be pinned against itself. Pinning it is what
+  // turns an unnoticed edit to the English wording into a failing test.
+  assert.deepEqual(I.MEMORY_CONTEXT_TEXT.en, {
+    heading: '# Long-term memory (persists across sessions, maintained on demand by the background review; this is the latest full snapshot)',
+    userTitle: 'USER (user profile / preferences)',
+    memoryTitle: 'MEMORY (environment facts, project facts, conventions, lessons)',
+    chars: 'chars',
+    items: 'entries',
+  }, 'the English memory snapshot copy changed')
+  assert.deepEqual(I.REVIEW_MEMORY_BLOCK_TEXT.en, {
+    section: "Current memory entries (oldText must match exactly one entry's original text; omit the memory field entirely when nothing is worth recording)",
+    items: 'entries',
+    open: ' (',
+    close: ')',
+    empty: '(empty)',
+  }, 'the English review memory block copy changed')
+  assert.deepEqual(I.REVIEW_INPUT_TEXT.en, {
+    catalog: 'Existing skill catalog (name: description)',
+    suspects: 'Full text of likely-relevant skills',
+    transcript: 'Session transcript (tail-preserving truncation)',
+    reasoning: '(reasoning)',
+    emptyCatalog: '(no skills available)',
+    truncated: '\n… (truncated)',
+  }, 'the English review input copy changed')
+  assert.deepEqual(I.LOOP_AWARE_TEXT.en, [
+    '# Wrap-up distillation (the background learning loop is running)',
+    '',
+    '- When wrapping up, if you find that a **skill loaded in this session** is wrong, missing steps, or outdated: fix it **immediately with your own tools** rather than leaving it to the background review (the background review will also catch it, but your context here is the most complete one).',
+    '- Leave all other distillation (new skills, lessons learned) to the background learning loop. **Do not** proactively write new skill files — two competing sets of instructions would fight each other.',
+  ], 'the English loop-aware copy changed')
 })
 
 test('no English surface leaks Chinese or fullwidth punctuation', () => {
