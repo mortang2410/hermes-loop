@@ -155,7 +155,7 @@ test('applyConclusion: patch passes CAS when unchanged, fails when file drifted'
 
 // ── end-to-end through apply(): fake services drive a full review ───────
 
-function fakeServices(conclusionText, { agentSkills, setupHasSkills = true, agentHasSkills = true } = {}) {
+function fakeServices(conclusionText, { agentSkills } = {}) {
   const created = []
   const agent = {
     session: {
@@ -166,37 +166,39 @@ function fakeServices(conclusionText, { agentSkills, setupHasSkills = true, agen
     whenIdle: async () => {},
     cancel() {},
   }
-  // The review agent's OWN ctx is what carries the full catalog: a plugin's
-  // `ctx.skills` resolves only to its include subtree's sibling registrations.
-  // `tools` is present because `setup` always calls `agentCtx.tools.restrict`.
+  // There is ONE context, as in the host: `setupAndPublish` runs
+  // `setup?.(prepared.agent.ctx, prepared.agent)` and `publish` returns that same
+  // agent (dsh-agent-loop/lib/index.js), so what setup receives IS `agent.ctx`.
+  // An earlier fixture modelled two contexts with independent switches, which is
+  // a state the host cannot produce (found in review round 2).
   //
-  // The setup context and the agent context are DIFFERENT objects with
-  // independent switches. Using one object for both made the two routes
-  // indistinguishable: hiding skills from setup also hid them from `agent.ctx`,
-  // so the secondary lookup could never be exercised (found in review round 1).
-  const setupCtx = {
-    get: (name) => (name === 'skills' && setupHasSkills ? agentSkills : undefined),
+  // The review agent's ctx carries the full catalog; a plugin's own `ctx.skills`
+  // resolves only to its include subtree's sibling registrations. `tools` is
+  // present because `setup` always calls `agentCtx.tools.restrict`.
+  const agentCtx = {
+    get: (name) => (name === 'skills' ? agentSkills : undefined),
     tools: { restrict() {} },
   }
-  if (agentSkills !== undefined) {
-    agent.ctx = { get: (name) => (name === 'skills' && agentHasSkills ? agentSkills : undefined) }
-  }
+  if (agentSkills !== undefined) agent.ctx = agentCtx
   return {
     created,
     agent,
-    setupCtx,
+    agentCtx,
     agents: {
       create: async (opts) => {
         created.push(opts)
-        // The host mints the agent context, then awaits `setup(agentCtx, agent)`
-        // before publication. Invoke it so the test exercises the real seam.
-        if (typeof opts.setup === 'function') await opts.setup(setupCtx, agent)
+        if (typeof opts.setup === 'function') await opts.setup(agentCtx, agent)
         return { agent, dispose: async () => {} }
       },
     },
     agentDefaultModel: { currentSelection: () => ({ provider: 'prov', model: 'mdl' }) },
   }
 }
+
+// A skills service as the review agent's own ctx exposes it. Tests that are not
+// about the catalog give the agent one of these, so the short-catalog guard does
+// not withhold the skill conclusion they are actually exercising.
+const catalogService = (skills, complete = true) => ({ snapshot: async () => ({ skills, complete }) })
 
 function setupPlugin(config, services) {
   const handlers = []
@@ -245,7 +247,7 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
   process.env.DSH_HOME = home
   try {
     const conclusion = JSON.stringify({ action: 'create', skill: 'e2e-skill', description: 'from e2e test', body: 'e2e body' })
-    const services = fakeServices('```json\n' + conclusion + '\n```')
+    const services = fakeServices('```json\n' + conclusion + '\n```', { agentSkills: catalogService([]) })
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
     const session = { id: 'session-e2e', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'do the thing' }] }
     t.fire(session, completedTurn)
@@ -539,7 +541,7 @@ test('write outcomes echo a plugin-notice user/message into the source session',
   try {
     const notices = []
     const conclusion = JSON.stringify({ action: 'create', skill: 'echo-skill', description: 'd', body: 'b', rationale: '值得存' })
-    const services = fakeServices('```json\n' + conclusion + '\n```')
+    const services = fakeServices('```json\n' + conclusion + '\n```', { agentSkills: catalogService([]) })
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
     const session = {
       id: 'session-echo',
@@ -896,7 +898,7 @@ test('curator: disabled setting skips the pass; created conclusions get register
   process.env.DSH_HOME = home2
   try {
     const conclusion = JSON.stringify({ action: 'create', skill: 'curator-e2e', description: 'd', body: 'b' })
-    const services = fakeServices('```json\n' + conclusion + '\n```')
+    const services = fakeServices('```json\n' + conclusion + '\n```', { agentSkills: catalogService([]) })
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
     const session = { id: 'session-cur', header: {}, deriveMessages: () => [] }
     t.fire(session, completedTurn)
@@ -1019,11 +1021,9 @@ test('review fix: patch succeeds for skills with description longer than the cat
       action: 'patch', skill: 'long-desc-skill', body: 'patched body',
       baseHash: sha256(original), baseDescription: longDesc,
     })
-    const services = fakeServices('```json\n' + conclusion + '\n```')
+    const catalog = [{ name: 'long-desc-skill', description: longDesc.slice(0, 500), resourceBase: { kind: 'directory', path: skillDir }, invocation: { modelInvocable: true } }]
     // snapshot 返回目录截断后的 description（复现真实环境），resourceBase 在全局库内
-    services.skills = {
-      snapshot: async () => ({ skills: [{ name: 'long-desc-skill', description: longDesc.slice(0, 500), resourceBase: { kind: 'directory', path: skillDir }, invocation: { modelInvocable: true } }], complete: true }),
-    }
+    const services = fakeServices('```json\n' + conclusion + '\n```', { agentSkills: catalogService(catalog) })
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
     const session = { id: 'session-longdesc', header: {}, deriveMessages: () => [{ role: 'user', content: 'we used long-desc-skill today' }] }
     t.fire(session, completedTurn)
@@ -1121,12 +1121,11 @@ test('review fix: the catalog is read through the review agent ctx, not the plug
   }
 })
 
-test('review fix: the setup callback alone is enough to scope the catalog read', async () => {
-  // The host mints `agentCtx` and awaits `setup(agentCtx, agent)` before
-  // publication, so the setup callback is the earliest and most reliable place
-  // to obtain the agent-scoped skills service. This case gives the agent NO
-  // `ctx.get`, so only the setup capture can reach the full catalog: if the
-  // implementation ever relies on `handle.agent.ctx` alone, this fails.
+test('review fix: the agent-scoped catalog is used, and the scope passed is the agent', async () => {
+  // The single route: `agent.ctx.get('skills')`, which the host guarantees is the
+  // same context `setup` received. This asserts the full catalog reaches the
+  // prompt AND that `scope` is the agent itself, since `scope` selects the
+  // viewing agent's layers and ScopeKey is an identity-compared object.
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-setup-'))
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
@@ -1136,9 +1135,11 @@ test('review fix: the setup callback alone is enough to scope the catalog read',
       description: `skill ${i} about deploys`,
       invocation: { modelInvocable: true },
     }))
-    const agentSkills = { snapshot: async () => ({ skills: fullCatalog, complete: true }) }
-    // The agent exposes NO skills service, so the setup capture is the only route.
-    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', { agentSkills, agentHasSkills: false })
+    let scopedOptions
+    const agentSkills = {
+      snapshot: async (opts) => { scopedOptions = opts; return { skills: fullCatalog, complete: true } },
+    }
+    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', { agentSkills })
     services.skills = {
       snapshot: async () => ({ skills: [{ name: 'sibling-only', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
     }
@@ -1147,8 +1148,9 @@ test('review fix: the setup callback alone is enough to scope the catalog read',
     t.fire(session, completedTurn)
     await new Promise((r) => setTimeout(r, 120))
     const prompt = services.created.find((c) => c && c.content).content[0].text
-    assert.ok(prompt.includes('setup-skill-11'), 'the setup-captured service must supply the catalog')
+    assert.ok(prompt.includes('setup-skill-11'), 'the agent-scoped service must supply the catalog')
     assert.ok(!prompt.includes('sibling-only'), 'the partial view must not be used')
+    assert.equal(scopedOptions.scope, services.agent, 'the snapshot must be scoped to the review agent')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
@@ -1156,35 +1158,49 @@ test('review fix: the setup callback alone is enough to scope the catalog read',
   }
 })
 
-test('review fix: the agent.ctx lookup is the route when setup sees no skills service', async () => {
-  // The secondary route. Removing the `agent.ctx.get('skills')` lookup in
-  // readCatalogFor left all other tests green, because the setup capture always
-  // answered first in them. Here setup is blind to skills while the agent
-  // context exposes one, so only the secondary lookup can reach the full catalog.
-  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-agentctx-'))
+test('review fix: the plugin-ctx fallback withholds a skill conclusion but keeps memory', async () => {
+  // The fallback read is the sibling-only registry, and it reports
+  // `complete: true` because every provider it asked answered in full. `complete`
+  // therefore cannot catch it, and a create from that catalog can add a duplicate
+  // of a skill the partial view never listed. The skill half must be withheld;
+  // memory does not read the catalog and must still land.
+  //
+  // This replaces an earlier test that modelled two different contexts (setup
+  // blind, agent.ctx aware). The host has ONE context: `setupAndPublish` calls
+  // `setup?.(prepared.agent.ctx, prepared.agent)` and `publish` returns that same
+  // agent, so that state is unreachable and the lookup it exercised was
+  // redundant (both found in review round 2).
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-fallback-skill-'))
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   try {
-    const fullCatalog = Array.from({ length: 9 }, (_, i) => ({
-      name: `agentctx-skill-${i}`,
-      description: `skill ${i} about deploys`,
-      invocation: { modelInvocable: true },
-    }))
-    const agentSkills = { snapshot: async () => ({ skills: fullCatalog, complete: true }) }
-    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', {
-      agentSkills,
-      setupHasSkills: false,
+    await mkdir(join(home, 'hermes-loop'), { recursive: true })
+    const conclusion = JSON.stringify({
+      action: 'create', skill: 'duplicate-maybe', description: 'd', body: '# b', rationale: 'r',
+      memory: { action: 'add', store: 'memory', text: 'the port is 3080', rationale: 'r' },
     })
+    // No agent-scoped service at all, so the read falls back to the plugin ctx.
+    const services = fakeServices('```json\n' + conclusion + '\n```')
     services.skills = {
       snapshot: async () => ({ skills: [{ name: 'sibling-only', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
     }
-    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
-    const session = { id: 'session-catalog-agentctx', header: {}, deriveMessages: () => [{ role: 'user', content: 'deploy' }] }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-fallback-skill', header: {}, deriveMessages: () => [{ role: 'user', content: 'deploy' }] }
     t.fire(session, completedTurn)
-    await new Promise((r) => setTimeout(r, 120))
-    const prompt = services.created.find((c) => c && c.content).content[0].text
-    assert.ok(prompt.includes('agentctx-skill-8'), 'the agent.ctx lookup must supply the catalog when setup saw none')
-    assert.ok(!prompt.includes('sibling-only'), 'the partial view must not be used')
+    await new Promise((r) => setTimeout(r, 150))
+
+    let wrote = true
+    try { await readFile(join(home, 'skills', 'duplicate-maybe', 'SKILL.md'), 'utf8') } catch { wrote = false }
+    assert.equal(wrote, false, 'a partial catalog must not be trusted to create a skill')
+
+    const mem = await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8')
+    assert.match(mem, /the port is 3080/, 'the memory channel must survive a partial catalog')
+
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogVia, 'plugin-ctx', 'the trace must name the partial registry')
+    assert.equal(inputs.catalogShorted, true, 'the trace must flag the catalog as short')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
@@ -1228,7 +1244,7 @@ test('review fix: an incomplete catalog withholds a skill conclusion but keeps m
     const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
       .trim().split('\n').map((l) => JSON.parse(l))
     const inputs = ledger.find((e) => e.event === 'review-inputs')
-    assert.equal(inputs.catalogComplete, false, 'the trace must record the incomplete catalog')
+    assert.equal(inputs.catalogShorted, true, 'the trace must flag the short catalog')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
@@ -1518,7 +1534,11 @@ async function runE2E(config, conclusionText) {
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   const notices = []
-  const services = fakeServices('```json\n' + conclusionText + '\n```')
+  // These cases are about the memory channel, not the catalog, so the review
+  // agent exposes a usable (empty) catalog and the short-catalog guard stays out
+  // of the way. Without an agent-scoped service the guard would correctly
+  // withhold the skill half, which is not what these cases exercise.
+  const services = fakeServices('```json\n' + conclusionText + '\n```', { agentSkills: catalogService([]) })
   const t = setupPlugin(config, services)
   const session = {
     id: 'session-mem-e2e',

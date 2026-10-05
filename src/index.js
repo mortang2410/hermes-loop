@@ -436,36 +436,34 @@ function sha256(text) {
  * library does. Reading through an agent context is what returns the full set;
  * this is the same defect the skill-router documents and fixes the same way
  * (packages/dsh-skill-router/src/index.ts, "The catalog MUST be read through an
- * agent context, not this plugin's own").
+ * agent context, not this plugin's own", which resolves the service with
+ * `agent.ctx?.get('skills')`).
  *
- * `complete` does NOT detect the missing-scope problem: a scope-limited read
- * reports `complete: true`, because each provider answered in full. It does
- * report a DIFFERENT shortfall, a provider that threw or returned an incomplete
- * observation (`dsh-skill`, listLayerCandidates sets cacheable=false on either),
- * so the caller treats `complete: false` as "this catalog may be missing rows"
- * and withholds skill conclusions while still letting the memory channel run.
+ * There is exactly ONE agent context, not two. The host runs
+ * `setup?.(prepared.agent.ctx, prepared.agent)` and later returns that same
+ * agent from `publish` (dsh-agent-loop/lib/index.js), so the context handed to
+ * `setup` IS `agent.ctx`. Capturing the service in `setup` and then reading
+ * `agent.ctx` again would be the same lookup twice; this reads it once, after
+ * creation, which is also where the host guarantees the scope is minted.
  *
- * The agent-scoped service is preferred in two places because they populate at
- * different moments: `scoped` is captured synchronously from the `setup`
- * callback (which receives the agent context directly), and `agent.ctx` is the
- * documented agent-scoped context, which may be the only route when setup sees
- * no service. Falling back to the plugin's own service keeps the review running,
- * but that read is the partial one, so the result carries `via` and the caller
- * traces it: a blind catalog must never be mistaken for a small library.
+ * A snapshot can be short in two independent ways, and each needs its own flag:
+ *  - `complete: false` — a provider threw or returned a partial observation
+ *    (`dsh-skill`, listLayerCandidates sets cacheable=false on either).
+ *  - `via: 'plugin-ctx'` — no agent-scoped service was available, so this is the
+ *    partial sibling registry. It still reports `complete: true`, because every
+ *    provider it asked answered in full, so `complete` alone cannot catch it.
+ * The caller withholds skill conclusions when EITHER says the catalog is short.
  *
  * @param {object} agent The review agent, whose `ctx` carries the scoped registry.
  * @param {object} ctx The plugin context, used only for the fallback read.
- * @param {{cwd?: string, signal?: AbortSignal, scoped?: object}} opts Lookup options,
- *   plus the skills service captured from `setup` when the host provided one.
+ * @param {{cwd?: string, signal?: AbortSignal}} opts Lookup options.
  * @returns {Promise<object>} The snapshot, plus `via`: 'agent-ctx' | 'plugin-ctx'.
  */
-async function readCatalogFor(agent, ctx, { cwd, signal, scoped } = {}) {
-  let service = scoped
-  if (!service) {
-    try {
-      service = agent && agent.ctx && typeof agent.ctx.get === 'function' ? agent.ctx.get('skills') : undefined
-    } catch { service = undefined }
-  }
+async function readCatalogFor(agent, ctx, { cwd, signal } = {}) {
+  let service
+  try {
+    service = agent && agent.ctx && typeof agent.ctx.get === 'function' ? agent.ctx.get('skills') : undefined
+  } catch { service = undefined }
   if (service && typeof service.snapshot === 'function') {
     const snapshot = await service.snapshot({ cwd, signal, scope: agent })
     return { ...snapshot, via: 'agent-ctx' }
@@ -1512,27 +1510,22 @@ module.exports = {
         // 2. zero-tool review agent（进程内、独立会话、不污染会话库）
         //
         // 先建 agent 再读目录：目录必须走 agent 自己的 ctx（理由见
-        // readCatalogFor）。setup 拿到的就是 agent 作用域上下文，在那里同步
-        // 取一次 skills 服务，比事后从 handle 上猜属性可靠。
+        // readCatalogFor）。宿主是 setup(prepared.agent.ctx, prepared.agent)，
+        // 再把同一个 agent 交回来，所以 agent.ctx 就是 setup 收到的那个上下文，
+        // 不必在 setup 里另存一份服务。
         const selection = ctx.agentDefaultModel.currentSelection()
-        let scopedSkills
         handle = await ctx.agents.create({
           sessionId: 'hermes-loop-review-' + randomUUID(),
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
           agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
           signal: controller.signal,
-          setup: (agentCtx) => {
-            agentCtx.tools.restrict({ allow: [] })
-            try {
-              if (typeof agentCtx.get === 'function') scopedSkills = agentCtx.get('skills')
-            } catch { scopedSkills = undefined }
-          },
+          setup: (agentCtx) => { agentCtx.tools.restrict({ allow: [] }) },
         })
         const agent = handle.agent
         trace('review-agent-created', { reviewSession: agent.id })
 
         // 3. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
-        const snapshot = await readCatalogFor(agent, ctx, { cwd, signal: controller.signal, scoped: scopedSkills })
+        const snapshot = await readCatalogFor(agent, ctx, { cwd, signal: controller.signal })
         const catalog = (snapshot.skills || [])
           .filter((s) => s.invocation === undefined || s.invocation.modelInvocable !== false)
           .map((s) => ({
@@ -1544,19 +1537,23 @@ module.exports = {
           ? catalog.map((s) => `- ${s.name}: ${s.description}`).join('\n')
           : REVIEW_INPUT_TEXT[lang].emptyCatalog
         const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
-        // A snapshot can be incomplete because a provider threw or returned a
-        // partial observation (dsh-skill sets cacheable=false on either). Such a
-        // catalog may be missing the very skill this review should patch, so a
-        // skill conclusion drawn from it is not trustworthy. `complete` cannot
-        // detect the missing-scope case, which is why `via` is traced too: the
-        // two flags catch different shortfalls.
-        const catalogComplete = snapshot.complete !== false
+        // The catalog can be short in two independent ways, and each needs its own
+        // flag because neither implies the other:
+        //  - `complete: false` — a provider threw or returned a partial
+        //    observation (dsh-skill sets cacheable=false on either).
+        //  - `via: 'plugin-ctx'` — no agent-scoped service existed, so this is the
+        //    sibling-only registry. It still reports `complete: true`, because
+        //    every provider it asked answered in full.
+        // Either way the catalog may be missing the skill this review should patch
+        // or create, so a skill conclusion drawn from it is not trustworthy.
+        const catalogShorted = snapshot.complete === false || snapshot.via === 'plugin-ctx'
         trace('review-inputs', {
           sessionId,
           messages: messages.length,
           catalogSize: catalog.length,
           catalogVia: snapshot.via,
-          catalogComplete,
+          catalogComplete: snapshot.complete !== false,
+          catalogShorted,
           suspects: suspects.map((s) => s.name),
         })
         const suspectBlocks = []
@@ -1673,11 +1670,12 @@ module.exports = {
           ctx.logger.info(`hermes-loop: review of session ${sessionId} → nothing. ${conclusion.rationale}`)
           return
         }
-        // An incomplete catalog can hide the skill this review should have
-        // patched, so a skill conclusion is withheld. The memory channel does not
-        // read the skill catalog and is unaffected, so it still runs.
-        if (!catalogComplete && conclusion.action !== 'nothing') {
-          ctx.logger.warn(`hermes-loop: review of session ${sessionId} returned ${conclusion.action} '${conclusion.skill}' but the catalog was incomplete (via=${snapshot.via}, rows=${catalog.length}); skill conclusion withheld`)
+        // A short catalog can hide the skill this review should have patched, or
+        // hide the existing skill a create would duplicate, so the skill half is
+        // withheld either way. The memory channel does not read the skill catalog
+        // and is unaffected, so it still runs.
+        if (catalogShorted && conclusion.action !== 'nothing') {
+          ctx.logger.warn(`hermes-loop: review of session ${sessionId} returned ${conclusion.action} '${conclusion.skill}' but the skill catalog was short (via=${snapshot.via}, complete=${snapshot.complete !== false}, rows=${catalog.length}); skill conclusion withheld`)
           if (!hasMemoryAction) return
           conclusion.action = 'nothing'
           delete conclusion.skill
