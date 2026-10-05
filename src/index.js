@@ -425,6 +425,51 @@ function sha256(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
+/**
+ * Read the skill catalog for a review, through the review agent's own context.
+ *
+ * A plugin's injected `ctx.skills` resolves to the registry of the include
+ * subtree that plugin row mounts in, which holds ONLY sibling runtime
+ * registrations (the office skills, vision-skills) and none of the filesystem
+ * provider's user skills. Measured on this host: a plugin-ctx read returns 3
+ * rows while the catalog holds 426, and the row count never grows as the
+ * library does. Reading through an agent context is what returns the full set;
+ * this is the same defect the skill-router documents and fixes the same way
+ * (packages/dsh-skill-router/src/index.ts, "The catalog MUST be read through an
+ * agent context, not this plugin's own").
+ *
+ * `complete` does NOT detect this: every partial read reports `complete: true`,
+ * so it cannot be used as a guard. Only the row count reveals it.
+ *
+ * The agent-scoped service is preferred in two places because they populate at
+ * different moments: `scoped` is captured synchronously from the `setup`
+ * callback (which receives the agent context directly), and `agent.ctx` is the
+ * documented agent-scoped context. Falling back to the plugin's own service
+ * keeps the review running, but that read is the partial one, so the result
+ * carries `via` and the caller traces it: a blind catalog must never be
+ * mistaken for a small library.
+ *
+ * @param {object} agent The review agent, whose `ctx` carries the scoped registry.
+ * @param {object} ctx The plugin context, used only for the fallback read.
+ * @param {{cwd?: string, signal?: AbortSignal, scoped?: object}} opts Lookup options,
+ *   plus the skills service captured from `setup` when the host provided one.
+ * @returns {Promise<object>} The snapshot, plus `via`: 'agent-ctx' | 'plugin-ctx'.
+ */
+async function readCatalogFor(agent, ctx, { cwd, signal, scoped } = {}) {
+  let service = scoped
+  if (!service) {
+    try {
+      service = agent && agent.ctx && typeof agent.ctx.get === 'function' ? agent.ctx.get('skills') : undefined
+    } catch { service = undefined }
+  }
+  if (service && typeof service.snapshot === 'function') {
+    const snapshot = await service.snapshot({ cwd, signal, scope: agent })
+    return { ...snapshot, via: 'agent-ctx' }
+  }
+  const snapshot = await ctx.skills.snapshot({ cwd, signal })
+  return { ...snapshot, via: 'plugin-ctx' }
+}
+
 /** Render final SKILL.md content: frontmatter (name/description) + body. */
 function buildSkillMd(name, description, body) {
   const yaml = `name: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description.replace(/\r?\n/g, ' '))}`
@@ -1061,6 +1106,7 @@ module.exports = {
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
     // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
+    readCatalogFor,
     LANGUAGE_RETRIES, createLanguageResolver, countLabel,
     REVIEW_PROMPT_TEXT, REVIEW_LANGUAGE_DIRECTIVE,
     MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
@@ -1457,9 +1503,32 @@ module.exports = {
         const messages = session.deriveMessages()
         const transcriptText = renderTranscript(messages, { ...eff, lang })
 
-        // 2. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
         const cwd = session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
-        const snapshot = await ctx.skills.snapshot({ cwd, signal: controller.signal })
+
+        // 2. zero-tool review agent（进程内、独立会话、不污染会话库）
+        //
+        // 先建 agent 再读目录：目录必须走 agent 自己的 ctx（理由见
+        // readCatalogFor）。setup 拿到的就是 agent 作用域上下文，在那里同步
+        // 取一次 skills 服务，比事后从 handle 上猜属性可靠。
+        const selection = ctx.agentDefaultModel.currentSelection()
+        let scopedSkills
+        handle = await ctx.agents.create({
+          sessionId: 'hermes-loop-review-' + randomUUID(),
+          meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
+          agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
+          signal: controller.signal,
+          setup: (agentCtx) => {
+            agentCtx.tools.restrict({ allow: [] })
+            try {
+              if (typeof agentCtx.get === 'function') scopedSkills = agentCtx.get('skills')
+            } catch { scopedSkills = undefined }
+          },
+        })
+        const agent = handle.agent
+        trace('review-agent-created', { reviewSession: agent.id })
+
+        // 3. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
+        const snapshot = await readCatalogFor(agent, ctx, { cwd, signal: controller.signal, scoped: scopedSkills })
         const catalog = (snapshot.skills || [])
           .filter((s) => s.invocation === undefined || s.invocation.modelInvocable !== false)
           .map((s) => ({
@@ -1471,7 +1540,7 @@ module.exports = {
           ? catalog.map((s) => `- ${s.name}: ${s.description}`).join('\n')
           : REVIEW_INPUT_TEXT[lang].emptyCatalog
         const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
-        trace('review-inputs', { sessionId, messages: messages.length, catalogSize: catalog.length, suspects: suspects.map((s) => s.name) })
+        trace('review-inputs', { sessionId, messages: messages.length, catalogSize: catalog.length, catalogVia: snapshot.via, suspects: suspects.map((s) => s.name) })
         const suspectBlocks = []
         const globalRoot = globalSkillsDir() + sep
         for (const suspect of suspects) {
@@ -1489,19 +1558,7 @@ module.exports = {
           suspectBlocks.push(`### suspect: ${suspect.name}\nbaseHash: ${hash}\nbaseDescription: ${JSON.stringify(descriptionOf(content) || '')}\n\n${content}`)
         }
 
-        // 3. zero-tool review agent（进程内、独立会话、不污染会话库）
-        const selection = ctx.agentDefaultModel.currentSelection()
-        handle = await ctx.agents.create({
-          sessionId: 'hermes-loop-review-' + randomUUID(),
-          meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
-          agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
-          signal: controller.signal,
-          setup: (agentCtx) => { agentCtx.tools.restrict({ allow: [] }) },
-        })
-        const agent = handle.agent
-        trace('review-agent-created', { reviewSession: agent.id })
-
-        // 3.5 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
+        // 4. 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
         const memoryOn = MEMORY_STORES.some((s) => memoryStoreEnabled(s, eff))
         let memoryBlock = ''
         if (memoryOn) {
@@ -1515,7 +1572,7 @@ module.exports = {
           memoryBlock = renderReviewMemoryBlock(stores, lang)
         }
 
-        // 4. pump the final assistant message out of the session log
+        // 5. pump the final assistant message out of the session log
         const firstSeq = agent.session.seq
         let finalText = ''
         let liveText = ''
@@ -1576,7 +1633,7 @@ module.exports = {
           return
         }
 
-        // 5. conclusion → writer
+        // 6. conclusion → writer
         const conclusion = parseConclusion(finalText)
         if (conclusion === undefined) {
           trace('conclusion', { sessionId, action: 'unparseable', head: finalText.slice(0, 160).replace(/\s+/g, ' ') })

@@ -155,7 +155,7 @@ test('applyConclusion: patch passes CAS when unchanged, fails when file drifted'
 
 // ── end-to-end through apply(): fake services drive a full review ───────
 
-function fakeServices(conclusionText) {
+function fakeServices(conclusionText, { agentSkills } = {}) {
   const created = []
   const agent = {
     session: {
@@ -166,9 +166,29 @@ function fakeServices(conclusionText) {
     whenIdle: async () => {},
     cancel() {},
   }
+  // The review agent's OWN ctx is what carries the full catalog: a plugin's
+  // `ctx.skills` resolves only to its include subtree's sibling registrations.
+  // `tools` is present because `setup` always calls `agentCtx.tools.restrict`.
+  // The setup context is held separately from `agent.ctx` so a test can exercise
+  // the setup seam alone, with the agent exposing no `ctx` at all.
+  const setupCtx = {
+    get: (name) => (name === 'skills' ? agentSkills : undefined),
+    tools: { restrict() {} },
+  }
+  if (agentSkills !== undefined) agent.ctx = setupCtx
   return {
     created,
-    agents: { create: async (opts) => { created.push(opts); return { agent, dispose: async () => {} } } },
+    agent,
+    setupCtx,
+    agents: {
+      create: async (opts) => {
+        created.push(opts)
+        // The host mints the agent context, then awaits `setup(agentCtx, agent)`
+        // before publication. Invoke it so the test exercises the real seam.
+        if (typeof opts.setup === 'function') await opts.setup(setupCtx, agent)
+        return { agent, dispose: async () => {} }
+      },
+    },
     agentDefaultModel: { currentSelection: () => ({ provider: 'prov', model: 'mdl' }) },
   }
 }
@@ -1028,6 +1048,133 @@ test('review fix: project-level suspects are not injected (writer only knows the
     const prompt = followup.content[0].text
     assert.ok(!prompt.includes('### suspect:'), 'project-level skill must not be injected as a suspect (patch would be guaranteed patch-missing)')
     assert.ok(prompt.includes('proj-skill'), 'catalog listing still includes it')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: the catalog is read through the review agent ctx, not the plugin ctx', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-scope-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+  // The regression this pins: a plugin's injected `ctx.skills` resolves to the
+  // registry of its own include subtree, which holds only sibling runtime
+  // registrations (3 rows on this host) and none of the filesystem provider's
+  // user skills (426 in the router's index). Reading through the plugin ctx
+  // therefore produced a catalog of 1 in every one of 92 recorded reviews, so
+  // ranking had nothing to rank and no suspect ever received a baseHash.
+  //
+  // The two services are deliberately different here, and the assertions name
+  // the full set: an implementation that reads the plugin ctx fails on the row
+  // count, not merely on a label.
+  const fullCatalog = Array.from({ length: 40 }, (_, i) => ({
+    name: `full-skill-${i}`,
+    description: `skill number ${i} about deploys and rollbacks`,
+    invocation: { modelInvocable: true },
+  }))
+  let scopedOptions
+  const agentSkills = {
+    snapshot: async (opts) => { scopedOptions = opts; return { skills: fullCatalog, complete: true } },
+  }
+  const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', { agentSkills })
+  // The plugin-scoped service answers with a single sibling registration, as the
+  // real host does. Anything reading this one is reading the partial view.
+  services.skills = {
+    snapshot: async () => ({ skills: [{ name: 'sibling-only', description: 'a sibling runtime registration', invocation: { modelInvocable: true } }], complete: true }),
+  }
+  const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+  const session = { id: 'session-catalog-scope', header: {}, deriveMessages: () => [{ role: 'user', content: 'we deployed today' }] }
+  t.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 120))
+
+  const followup = services.created.find((c) => c && c.content)
+  assert.ok(followup, 'the review must reach the model with a prompt')
+  const prompt = followup.content[0].text
+  assert.ok(prompt.includes('full-skill-39'), 'the prompt must carry the agent-scoped catalog, not the plugin-scoped one')
+  assert.ok(!prompt.includes('sibling-only'), 'the partial sibling view must not be the catalog the review sees')
+
+  // The scope must be the agent itself: `scope` selects the viewing agent's
+  // layers, and `ScopeKey` is an identity-compared object, so only the agent
+  // yields the session's own catalog.
+  assert.ok(scopedOptions, 'the agent-scoped service must be called')
+  assert.equal(scopedOptions.scope, services.agent, 'the snapshot must be scoped to the review agent')
+
+  // And the ledger must record which registry answered, so a partial view can
+  // never again look like a small library.
+  const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
+    .trim().split('\n').map((l) => JSON.parse(l))
+  const inputs = ledger.find((e) => e.event === 'review-inputs')
+  assert.equal(inputs.catalogSize, 40, 'the traced catalog size must be the agent-scoped row count')
+  assert.equal(inputs.catalogVia, 'agent-ctx', 'the trace must name the registry that answered')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: the setup callback alone is enough to scope the catalog read', async () => {
+  // The host mints `agentCtx` and awaits `setup(agentCtx, agent)` before
+  // publication, so the setup callback is the earliest and most reliable place
+  // to obtain the agent-scoped skills service. This case gives the agent NO
+  // `ctx.get`, so only the setup capture can reach the full catalog: if the
+  // implementation ever relies on `handle.agent.ctx` alone, this fails.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-setup-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const fullCatalog = Array.from({ length: 12 }, (_, i) => ({
+      name: `setup-skill-${i}`,
+      description: `skill ${i} about deploys`,
+      invocation: { modelInvocable: true },
+    }))
+    const agentSkills = { snapshot: async () => ({ skills: fullCatalog, complete: true }) }
+    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', { agentSkills })
+    // Strip the agent's own ctx so the setup-captured service is the only route.
+    delete services.agent.ctx
+    services.skills = {
+      snapshot: async () => ({ skills: [{ name: 'sibling-only', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+    const session = { id: 'session-catalog-setup', header: {}, deriveMessages: () => [{ role: 'user', content: 'deploy' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    const prompt = services.created.find((c) => c && c.content).content[0].text
+    assert.ok(prompt.includes('setup-skill-11'), 'the setup-captured service must supply the catalog')
+    assert.ok(!prompt.includes('sibling-only'), 'the partial view must not be used')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: a host with no agent-scoped skills service falls back and says so', async () => {
+  // The fallback keeps a review running on a host that exposes no scoped
+  // context, but the read is the partial one. The trace must name it, because a
+  // blind catalog that looks like a small library is the defect this whole
+  // change exists to make visible.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-fallback-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```')
+    delete services.agent.ctx
+    services.skills = {
+      snapshot: async () => ({ skills: [{ name: 'only-skill', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+    const session = { id: 'session-catalog-fallback', header: {}, deriveMessages: () => [{ role: 'user', content: 'hi' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogSize, 1, 'the fallback keeps the review running')
+    assert.equal(inputs.catalogVia, 'plugin-ctx', 'the trace must name the partial registry, not hide it')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
