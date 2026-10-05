@@ -300,6 +300,19 @@ test('entry counts use the singular label for exactly one entry, in en', () => {
   const blockTwo = I.renderReviewMemoryBlock([{ store: 'memory', entries: ['a', 'b'] }], 'en')
   assert.match(blockTwo, /### MEMORY \(2 entries\)/, 'two entries must use the plural label in the block')
 
+  // Zero is plural in English, and it IS reachable: the review memory block
+  // lists every enabled store, including one that holds nothing (the snapshot
+  // skips empty stores, so only the block can render a zero). `n > 1 ? many : one`
+  // says "0 entry" and would otherwise pass every assertion above.
+  const blockNone = I.renderReviewMemoryBlock([{ store: 'memory', entries: [] }], 'en')
+  assert.match(blockNone, /### MEMORY \(0 entries\)/, 'an empty store must say "0 entries"')
+  assert.ok(!blockNone.includes('0 entry)'), 'an empty store must not say "0 entry"')
+  assert.match(
+    I.renderReviewMemoryBlock([{ store: 'memory', entries: [] }], 'zh'),
+    /### MEMORY（0 条）/,
+    'zh must render a zero count as 条',
+  )
+
   // zh must not change between the two counts, since both labels are 条.
   const zhOne = I.renderMemoryContext({ memoryEnabled: true, userProfileEnabled: true }, one, 'zh')
   const zhTwo = I.renderMemoryContext({ memoryEnabled: true, userProfileEnabled: true }, () => '§ a\n§ b', 'zh')
@@ -760,6 +773,46 @@ test('invalidate() re-reads the document, so a language change takes effect', ()
   preference = 'en'
   language.invalidate()
   assert.equal(language(), 'en', 'invalidation is repeatable in both directions')
+})
+
+test('invalidate() restores the full retry budget, not just the cache', () => {
+  // The retry counter must be reset along with the cache, or a locale row that
+  // mounts AFTER the budget was already spent would be read once and then
+  // immediately settle on the conservative answer. This is exactly the
+  // late-mount scenario the budget exists for, so the counter reset is
+  // load-bearing: `invalidate = () => { cache = undefined }` alone (dropping
+  // `attempts = 0`) passes the test above, because that resolver never retries.
+  let readable = false
+  const pending = []
+  const language = I.createLanguageResolver({
+    read: () => (readable
+      ? { value: 'en', seen: true }
+      : { value: undefined, seen: false }),
+    schedule: (fn) => pending.push(fn),
+  })
+
+  // Burn the budget while the document is unreadable.
+  assert.equal(language(), 'zh', 'an unreadable document resolves conservatively')
+  while (pending.length > 0) pending.shift()()
+  assert.equal(language(), 'zh', 'the budget is exhausted')
+  assert.equal(pending.length, 0, 'a spent budget schedules nothing further')
+  assert.equal(language.state().attempts, I.LANGUAGE_RETRIES + 2, 'the counter recorded the spend')
+
+  // The locale row mounts late and the settings event fires.
+  readable = true
+  language.invalidate()
+  assert.equal(language(), 'en', 'a late-mounting row must be picked up after invalidate()')
+  assert.equal(language.state().attempts, 0, 'invalidate() must reset the retry counter too')
+
+  // And the restored budget must be a FULL one, so a second unreadable stretch
+  // retries as many times as the first rather than giving up at once.
+  readable = false
+  language.invalidate()
+  assert.equal(language(), 'zh')
+  assert.equal(pending.length, 1, 'one retry scheduled')
+  let drains = 0
+  while (pending.length > 0) { drains++; pending.shift()() }
+  assert.equal(drains, I.LANGUAGE_RETRIES + 1, 'the second stretch gets the same full budget')
 })
 
 test('the memory block drops its section when both stores are off, in both languages', () => {
