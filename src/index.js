@@ -254,7 +254,7 @@ function contentToText(content) {
 }
 
 /** Tail-keeping transcript render: last `maxMessages` entries, `maxChars` budget. */
-function renderTranscript(messages, { maxChars = DEFAULTS.maxTranscriptChars, maxMessages = DEFAULTS.maxTranscriptMessages } = {}) {
+function renderTranscript(messages, { maxChars = DEFAULTS.maxTranscriptChars, maxMessages = DEFAULTS.maxTranscriptMessages, lang } = {}) {
   const lines = []
   for (const message of messages.slice(-maxMessages)) {
     const role = message && typeof message.role === 'string' ? message.role : 'unknown'
@@ -264,7 +264,7 @@ function renderTranscript(messages, { maxChars = DEFAULTS.maxTranscriptChars, ma
     lines.push(`### ${role}\n${text}`)
   }
   let out = lines.join('\n\n')
-  if (out.length > maxChars) out = '…（早段已按保尾策略截断）\n' + out.slice(out.length - maxChars)
+  if (out.length > maxChars) out = REVIEW_INPUT_TEXT[languageOf(lang)].transcriptTruncated + '\n' + out.slice(out.length - maxChars)
   return out
 }
 
@@ -667,6 +667,7 @@ const REVIEW_INPUT_TEXT = {
     suspects: '疑似相关 skill 全文',
     transcript: '会话转写（保尾截断）',
     reasoning: '（推理中）',
+    transcriptTruncated: '…（早段已按保尾策略截断）',
     emptyCatalog: '（当前无可用 skill）',
     truncated: '\n…（截断）',
   },
@@ -675,6 +676,7 @@ const REVIEW_INPUT_TEXT = {
     suspects: 'Full text of likely-relevant skills',
     transcript: 'Session transcript (tail-preserving truncation)',
     reasoning: '(reasoning)',
+    transcriptTruncated: '…(earlier messages dropped; tail kept)',
     emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
   },
@@ -1401,7 +1403,7 @@ module.exports = {
         const lang = language()
         // 1. transcript tail
         const messages = session.deriveMessages()
-        const transcriptText = renderTranscript(messages, eff)
+        const transcriptText = renderTranscript(messages, { ...eff, lang })
 
         // 2. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
         const cwd = session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined

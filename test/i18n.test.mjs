@@ -69,7 +69,10 @@ function upstreamLiteral(anchor, what) {
   // backslash. lastIndexOf alone can land on a previous literal's closing quote.
   let open = source.lastIndexOf("'", at)
   while (open > 0 && source[open - 1] === '\\') open = source.lastIndexOf("'", open - 1)
-  const close = source.indexOf("'", at)
+  // The closing quote needs the same skip: an escaped apostrophe inside the
+  // literal (as in "don't") is not a terminator.
+  let close = source.indexOf("'", at)
+  while (close > 0 && source[close - 1] === '\\') close = source.indexOf("'", close + 1)
   assert.notEqual(close, -1, `unterminated literal for ${what}`)
   return source.slice(open + 1, close).replace(/\\(['"\\])/g, '$1').replace(/\\n/g, '\n')
 }
@@ -350,6 +353,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     suspects: 'Full text of likely-relevant skills',
     transcript: 'Session transcript (tail-preserving truncation)',
     reasoning: '(reasoning)',
+    transcriptTruncated: '…(earlier messages dropped; tail kept)',
     emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
   }, 'the English review input copy changed')
@@ -372,10 +376,25 @@ test('no English surface leaks Chinese or fullwidth punctuation', () => {
     'loop-aware': I.LOOP_AWARE_TEXT.en.join('\n'),
     'review input': Object.values(I.REVIEW_INPUT_TEXT.en).join('\n'),
     'memory context dict': Object.values(I.MEMORY_CONTEXT_TEXT.en).join('\n'),
+    // The transcript is spliced into the prompt verbatim, past every dictionary,
+    // so it has to be rendered here or a marker it owns goes unchecked.
+    'rendered transcript (truncated)': I.renderTranscript(
+      Array.from({ length: 40 }, () => ({ role: 'user', content: 'y'.repeat(380) })),
+      { lang: 'en' },
+    ),
   }
   for (const [name, text] of Object.entries(surfaces)) {
     assert.ok(!cjk.test(text), `${name} still contains CJK: ${JSON.stringify(text.match(cjk))}`)
   }
+  // Under-length transcripts and zh must both still work.
+  assert.ok(!cjk.test(I.renderTranscript([{ role: 'user', content: 'short' }], { lang: 'en' })))
+  // The per-message cap runs first, so exceeding the transcript limit needs many
+  // messages rather than one long one.
+  const long = Array.from({ length: 40 }, () => ({ role: 'user', content: 'x'.repeat(380) }))
+  assert.match(I.renderTranscript(long, { lang: 'zh' }), /^…（早段已按保尾策略截断）/,
+    'the zh transcript marker must stay byte-identical to the historical text')
+  assert.match(I.renderTranscript(long, { lang: 'en' }), /^…\(earlier messages dropped; tail kept\)/,
+    'the English transcript must carry its own marker')
 })
 
 test('an absent locale row costs nothing once the retry budget is spent', () => {
