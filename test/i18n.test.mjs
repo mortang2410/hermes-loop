@@ -234,6 +234,11 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   )
   assert.equal(I.MEMORY_CONTEXT_TEXT.zh.chars, '字符')
   assert.equal(I.MEMORY_CONTEXT_TEXT.zh.items, '条')
+  // zh has no singular form, so the count-selected label must equal the plural
+  // one. If a future edit gave zh a distinct singular, the rendered zh snapshot
+  // would stop matching upstream for a one-entry store.
+  assert.equal(I.MEMORY_CONTEXT_TEXT.zh.item, '条')
+  assert.equal(I.REVIEW_MEMORY_BLOCK_TEXT.zh.item, '条')
 
   // The memory block is assembled by a template upstream writes inline, so the
   // rendered zh line is compared against that template's own text. This is what
@@ -263,12 +268,43 @@ test('the memory snapshot renders in the chosen language', () => {
   assert.ok(en.startsWith(I.MEMORY_CONTEXT_TEXT.en.heading), 'the English heading must be the one the dictionary carries')
   assert.ok(en.includes(`## ${I.MEMORY_CONTEXT_TEXT.en.userTitle}`), 'the English user title must be the one the dictionary carries')
   assert.ok(en.includes(`## ${I.MEMORY_CONTEXT_TEXT.en.memoryTitle}`), 'the English memory title must be the one the dictionary carries')
-  assert.ok(en.includes(`1 ${I.MEMORY_CONTEXT_TEXT.en.items}`), 'the English entry count must use the dictionary label')
+  // Both stores hold exactly one entry here, so the singular label is what must
+  // appear. "1 entries" was the shipped wording and is the defect this pins.
+  assert.ok(en.includes(`1 ${I.MEMORY_CONTEXT_TEXT.en.item}`), 'the English entry count must use the singular label')
+  assert.ok(!en.includes(`1 ${I.MEMORY_CONTEXT_TEXT.en.items}`), 'the English entry count must not say "1 entries"')
   assert.ok(en.includes(`2200 ${I.MEMORY_CONTEXT_TEXT.en.chars}`), 'the English char count must use the dictionary label')
   assert.ok(en.includes('服务跑在 3080 端口'), 'entry text must survive untouched')
 
   assert.match(zh, /^# 长期记忆/)
+  // zh has no singular form: both labels are 条, so the rendered line is
+  // unchanged and the upstream parity comparison still holds.
+  assert.equal(I.MEMORY_CONTEXT_TEXT.zh.item, I.MEMORY_CONTEXT_TEXT.zh.items)
   assert.ok(zh.includes(`1 ${I.MEMORY_CONTEXT_TEXT.zh.items}`), 'the zh count must use the dictionary label')
+})
+
+test('entry counts use the singular label for exactly one entry, in en', () => {
+  // A count of one is the only case where the label changes, and it is reachable
+  // whenever a store holds a single entry. Both renderers are checked because
+  // they index two different dictionaries.
+  const one = (store) => (store === 'user' ? '§ only one' : '')
+  const snapshot = I.renderMemoryContext({ memoryEnabled: true, userProfileEnabled: true }, one, 'en')
+  assert.match(snapshot, /· 1 entry\n/, 'the snapshot must say "1 entry"')
+  assert.ok(!snapshot.includes('1 entries'), 'the snapshot must not say "1 entries"')
+
+  const block = I.renderReviewMemoryBlock([{ store: 'user', entries: ['only one'] }], 'en')
+  assert.match(block, /### USER \(1 entry\)/, 'the review memory block must say "1 entry"')
+
+  // Plural for anything above one, and zero is plural in English.
+  const two = I.renderMemoryContext({ memoryEnabled: true, userProfileEnabled: true }, () => '§ a\n§ b', 'en')
+  assert.match(two, /· 2 entries\n/, 'two entries must use the plural label')
+  const blockTwo = I.renderReviewMemoryBlock([{ store: 'memory', entries: ['a', 'b'] }], 'en')
+  assert.match(blockTwo, /### MEMORY \(2 entries\)/, 'two entries must use the plural label in the block')
+
+  // zh must not change between the two counts, since both labels are 条.
+  const zhOne = I.renderMemoryContext({ memoryEnabled: true, userProfileEnabled: true }, one, 'zh')
+  const zhTwo = I.renderMemoryContext({ memoryEnabled: true, userProfileEnabled: true }, () => '§ a\n§ b', 'zh')
+  assert.match(zhOne, /· 1 条\n/)
+  assert.match(zhTwo, /· 2 条\n/)
 })
 
 test('the review prompt switches wholesale and keeps its contract', () => {
@@ -357,10 +393,12 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     userTitle: 'USER (user profile / preferences)',
     memoryTitle: 'MEMORY (environment facts, project facts, conventions, lessons)',
     chars: 'chars',
+    item: 'entry',
     items: 'entries',
   }, 'the English memory snapshot copy changed')
   assert.deepEqual(I.REVIEW_MEMORY_BLOCK_TEXT.en, {
     section: "Current memory entries (oldText must match exactly one entry's original text; omit the memory field entirely when nothing is worth recording)",
+    item: 'entry',
     items: 'entries',
     open: ' (',
     close: ')',
@@ -649,25 +687,79 @@ test('an absent locale row costs nothing once the retry budget is spent', () => 
   // describe() walks every plugin row in the profile. A profile with no locale
   // row (headless, or before the entry mounts) must stop paying for it rather
   // than re-reading on every prompt assembly forever.
+  //
+  // This drives the SHIPPED resolver (`createLanguageResolver`, the same factory
+  // `apply` calls), not a local reimplementation. An earlier version of this test
+  // copied the guard inline, so mutating LANGUAGE_RETRIES to 1000 in src/index.js
+  // left the whole suite green; the retry budget was untested.
   let calls = 0
   const ctx = { settings: { describe: () => { calls++; return [] } } }
   const read = () => I.readLocalePreference(ctx)
-  // The guard itself is what the plugin uses; assert the budget is bounded.
-  let retries = 0
-  let cache
-  const language = () => {
-    if (cache === undefined) {
-      const r = read()
-      if (r.seen) cache = I.languageOf(r.value)
-      else if (retries++ > 15) cache = I.DEFAULT_LANGUAGE
-    }
-    return cache
+
+  // The production budget is what the assertion below is about, so pin it first.
+  // A bare `LANGUAGE_RETRIES = 1000` edit fails here with the reason.
+  assert.equal(I.LANGUAGE_RETRIES, 15, 'the retry budget changed; ~30 s at 2 s per retry')
+
+  // Timer-driven retries are captured instead of waited on, so the budget is
+  // drained synchronously and no test sleeps for 30 s.
+  const pending = []
+  const language = I.createLanguageResolver({ read, schedule: (fn) => pending.push(fn) })
+
+  // First call reads, finds nothing readable, and schedules exactly one retry.
+  assert.equal(language(), 'zh', 'an unreadable document resolves conservatively')
+  assert.equal(pending.length, 1, 'exactly one retry must be scheduled per attempt')
+  assert.equal(calls, 1, 'the first call reads once')
+
+  // Drain the scheduled retries. The guard is `attempts++ > LANGUAGE_RETRIES`
+  // starting from 0, so the retry that settles the resolver is the 16th attempt:
+  // 15 retries that reschedule, then one that gives up. Reads are one per
+  // attempt plus the initial one.
+  let drains = 0
+  while (pending.length > 0) {
+    drains++
+    assert.ok(drains <= I.LANGUAGE_RETRIES + 2, 'the retry budget must be bounded')
+    pending.shift()()
   }
+  assert.equal(drains, I.LANGUAGE_RETRIES + 1, 'the resolver must stop retrying at the budget')
+  assert.equal(calls, I.LANGUAGE_RETRIES + 2, 'one initial read, then one per attempt')
+  assert.equal(language(), 'zh', 'the give-up answer is the historical Chinese')
+
+  // Once settled it must not read again: that is the cost this cache exists to avoid.
+  const settled = calls
   for (let i = 0; i < 50; i++) language()
-  const before = calls
-  for (let i = 0; i < 50; i++) language()
-  assert.equal(calls - before, 0, 'language() must cache the give-up answer instead of re-reading')
-  assert.equal(language(), 'zh', 'the give-up answer is upstream\'s Chinese')
+  assert.equal(calls - settled, 0, 'language() must cache the give-up answer instead of re-reading')
+  assert.equal(pending.length, 0, 'a settled resolver must not schedule more retries')
+})
+
+test('a readable document with no preference resolves at once, without retrying', () => {
+  // The distinction the resolver exists for: `seen:true, value:undefined` is a
+  // readable document where the user simply never chose a language. It must
+  // settle immediately; only an UNREADABLE document (seen:false) retries.
+  const ctx = { settings: { describe: () => [{ ns: 'locale', value: {} }] } }
+  const pending = []
+  const language = I.createLanguageResolver({
+    read: () => I.readLocalePreference(ctx),
+    schedule: (fn) => pending.push(fn),
+  })
+  assert.equal(language(), 'zh', 'no explicit preference means the historical text')
+  assert.equal(pending.length, 0, 'a readable document must not schedule retries')
+})
+
+test('invalidate() re-reads the document, so a language change takes effect', () => {
+  // The Language row writes through `settings/document-updated`, which calls
+  // invalidate(). Without it the first resolved language would stick for the
+  // life of the host process.
+  let preference = 'en'
+  const ctx = () => ({ settings: { describe: () => [{ ns: 'locale', value: { preference } }] } })
+  const language = I.createLanguageResolver({ read: () => I.readLocalePreference(ctx()) })
+  assert.equal(language(), 'en', 'the initial preference resolves')
+  preference = 'zh'
+  assert.equal(language(), 'en', 'the cache holds until invalidated')
+  language.invalidate()
+  assert.equal(language(), 'zh', 'invalidate() must pick up the new preference')
+  preference = 'en'
+  language.invalidate()
+  assert.equal(language(), 'en', 'invalidation is repeatable in both directions')
 })
 
 test('the memory block drops its section when both stores are off, in both languages', () => {

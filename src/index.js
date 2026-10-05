@@ -67,6 +67,7 @@ const DEFAULT_LANGUAGE = 'zh'
 // ~30 s of retrying: long enough for the settings entry to mount behind us,
 // short enough that a profile which simply has no locale row stops paying for it.
 const LANGUAGE_RETRIES = 15
+const LANGUAGE_RETRY_DELAY_MS = 2000
 
 /**
  * Read the durable locale preference out of the settings document.
@@ -99,6 +100,49 @@ function readLocalePreference(ctx, namespace = LOCALE_SETTINGS_NS) {
  */
 function languageOf(value) {
   return typeof value === 'string' && value.toLowerCase().startsWith('en') ? 'en' : 'zh'
+}
+
+/**
+ * Build the cached language resolver `apply` uses.
+ *
+ * Extracted so the retry budget is exercised as shipped. A test that
+ * reimplements this closure cannot fail when the production threshold changes:
+ * mutating LANGUAGE_RETRIES to 1000 in src/index.js left the whole suite green,
+ * because the test carried its own copy of the guard.
+ *
+ * @param {object} opts
+ * @param {() => {value: string|undefined, seen: boolean}} opts.read Reads the surrogate
+ *   preference. `seen:false` means the document is unreadable (retry); `seen:true`
+ *   with no value means it is readable and no choice was recorded (resolve now).
+ * @param {(retry: () => void) => void} [opts.schedule] Schedules one retry.
+ * @param {number} [opts.retries] Retry budget before settling on DEFAULT_LANGUAGE.
+ * @returns {(() => string) & {invalidate: () => void, state: () => object}} The resolver,
+ *   with `invalidate()` for the settings-changed event and `state()` for tests.
+ */
+function createLanguageResolver({ read, schedule, retries = LANGUAGE_RETRIES }) {
+  let cache
+  let attempts = 0
+  const resolve = () => {
+    if (cache === undefined) {
+      const { value, seen } = read()
+      if (seen) {
+        cache = languageOf(value)
+      } else if (attempts++ > retries) {
+        // Give up on an unreadable settings document and cache the conservative
+        // answer. Caching it matters: describe() walks every plugin row in the
+        // profile, and leaving the cache undefined would pay that cost on every
+        // prompt assembly forever. A later document-updated event still
+        // re-reads, so a locale row that mounts late is picked up.
+        cache = DEFAULT_LANGUAGE
+      } else if (schedule) {
+        schedule(resolve)
+      }
+    }
+    return cache ?? DEFAULT_LANGUAGE
+  }
+  resolve.invalidate = () => { cache = undefined; attempts = 0 }
+  resolve.state = () => ({ cache, attempts })
+  return resolve
 }
 const BODY_MAX_CHARS = 128 * 1024
 const SUSPECT_BODY_MAX_CHARS = 8 * 1024
@@ -620,14 +664,21 @@ async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enab
 // ── Model-facing copy, one entry per supported language ─────────────────────
 //
 // zh entries are upstream's literals verbatim, so an unset preference produces
-// byte-identical output to 0.1.16, so this is a no-op until the user picks a
+// byte-identical output to 0.1.16: this is a no-op until the user picks a
 // language in Settings → Language.
+
+// 条目计数在英文里有单复数（"1 entry" / "3 entries"），中文没有。zh 的 item 与
+// items 同为「条」，所以按计数选词也不改变 zh 的渲染，上游 parity 不受影响。
+// chars 不带单数：它跟在限额后面（"482/2200 chars"），而限额最小 200。
+const countLabel = (n, one, many) => `${n} ${n === 1 ? one : many}`
+
 const MEMORY_CONTEXT_TEXT = {
   zh: {
     heading: '# 长期记忆（跨会话持久，后台复盘按需维护；以下为最新全量快照）',
     userTitle: 'USER（用户画像/偏好）',
     memoryTitle: 'MEMORY（环境/项目事实/约定/教训）',
     chars: '字符',
+    item: '条',
     items: '条',
   },
   en: {
@@ -635,6 +686,7 @@ const MEMORY_CONTEXT_TEXT = {
     userTitle: 'USER (user profile / preferences)',
     memoryTitle: 'MEMORY (environment facts, project facts, conventions, lessons)',
     chars: 'chars',
+    item: 'entry',
     items: 'entries',
   },
 }
@@ -642,8 +694,8 @@ const MEMORY_CONTEXT_TEXT = {
 // 括号也是复述文案的一部分：上游把全角「（）」直接写在模板里，en 分支若沿用全角，
 // 就会在纯英文复盘输入里留下唯一的 CJK 字符。zh 保持上游全角不动。
 const REVIEW_MEMORY_BLOCK_TEXT = {
-  zh: { section: '当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）', items: '条', open: '（', close: '）', empty: '（空）' },
-  en: { section: 'Current memory entries (oldText must match exactly one entry\'s original text; omit the memory field entirely when nothing is worth recording)', items: 'entries', open: ' (', close: ')', empty: '(empty)' },
+  zh: { section: '当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）', item: '条', items: '条', open: '（', close: '）', empty: '（空）' },
+  en: { section: 'Current memory entries (oldText must match exactly one entry\'s original text; omit the memory field entirely when nothing is worth recording)', item: 'entry', items: 'entries', open: ' (', close: ')', empty: '(empty)' },
 }
 
 const LOOP_AWARE_TEXT = {
@@ -700,7 +752,7 @@ function renderMemoryContext(eff, readRaw, lang) {
     if (entries.length === 0) continue
     const chars = memoryCharsOf(entries)
     const title = store === 'user' ? T.userTitle : T.memoryTitle
-    sections.push(`## ${title} — ${chars}/${memoryStoreLimit(store, eff)} ${T.chars} · ${entries.length} ${T.items}\n${entries.map((e) => '§ ' + e).join('\n')}`)
+    sections.push(`## ${title} — ${chars}/${memoryStoreLimit(store, eff)} ${T.chars} · ${countLabel(entries.length, T.item, T.items)}\n${entries.map((e) => '§ ' + e).join('\n')}`)
   }
   if (sections.length === 0) return ''
   return [
@@ -970,7 +1022,7 @@ function renderReviewMemoryBlock(stores, lang) {
   const MT = REVIEW_MEMORY_BLOCK_TEXT[languageOf(lang)]
   if (stores.length === 0) return ''
   const storeParts = stores.map(({ store, entries }) =>
-    `### ${store === 'user' ? 'USER' : 'MEMORY'}${MT.open}${entries.length} ${MT.items}${MT.close}\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : MT.empty}`)
+    `### ${store === 'user' ? 'USER' : 'MEMORY'}${MT.open}${countLabel(entries.length, MT.item, MT.items)}${MT.close}\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : MT.empty}`)
   return '\n## ' + MT.section + '\n' + storeParts.join('\n\n')
 }
 
@@ -1009,6 +1061,7 @@ module.exports = {
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
     // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
+    LANGUAGE_RETRIES, createLanguageResolver, countLabel,
     REVIEW_PROMPT_TEXT, REVIEW_LANGUAGE_DIRECTIVE,
     MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
   },
@@ -1054,30 +1107,15 @@ module.exports = {
     // source of truth. Cached because three surfaces read it per turn; the
     // watcher below invalidates it. An unreadable document is retried rather
     // than cached as zh, so a locale entry that mounts late still takes effect.
-    let languageCache = undefined
-    let languageRetries = 0
+    // The resolver itself is module-level so the retry budget is testable as shipped.
     // scope(agent) → 该会话冻结快照时用的语言。记忆快照按会话首冻结，语言必须一起
     // 冻结：否则 loop-aware section（每次 assemble 重读）会中途换语言，而已冻结的
     // 快照仍是旧语言，同一会话出现两种语言。
     const memoryLang = new WeakMap()
-    function language() {
-      if (languageCache === undefined) {
-        const read = readLocalePreference(ctx)
-        if (read.seen) {
-          languageCache = languageOf(read.value)
-        } else if (languageRetries++ > LANGUAGE_RETRIES) {
-          // Give up on an absent settings document and cache the conservative
-          // answer. Caching it matters: describe() walks every plugin row in the
-          // profile, and leaving the cache undefined would pay that cost on
-          // every prompt assembly forever. A later document-updated event still
-          // re-reads, so a locale row that mounts late is picked up.
-          languageCache = DEFAULT_LANGUAGE
-        } else {
-          setTimeout(() => { languageCache = undefined; language() }, 2000).unref?.()
-        }
-      }
-      return languageCache ?? DEFAULT_LANGUAGE
-    }
+    const language = createLanguageResolver({
+      read: () => readLocalePreference(ctx),
+      schedule: (retry) => setTimeout(retry, LANGUAGE_RETRY_DELAY_MS).unref?.(),
+    })
     ctx.logger.info && ctx.logger.info(
       `hermes-loop: review copy language ${language()} (settings ns=${LOCALE_SETTINGS_NS}; unset → ${DEFAULT_LANGUAGE})`)
 
@@ -1087,7 +1125,7 @@ module.exports = {
         ctx.effect(() => {
           const off = ctx.on('settings/document-updated', (ns) => {
             // locale changes too: the Language row writes through this same event.
-            if (ns === LOCALE_SETTINGS_NS) { languageCache = undefined; languageRetries = 0 }
+            if (ns === LOCALE_SETTINGS_NS) language.invalidate()
             if (ns !== SETTINGS_NS) return
             const d = readDescriptor()
             if (d && d.value && typeof d.value === 'object') liveSettings = d.value
