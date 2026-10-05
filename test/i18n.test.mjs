@@ -510,22 +510,60 @@ test('the loop-aware section provider renders the chosen language', () => {
 
   const zh = hostContext({ unset: true }).section('hermes:loop-aware')
   assert.equal(zh.text(), I.LOOP_AWARE_TEXT.zh.join('\n'))
+
+  // Production calls the provider with an assembly scope. A scope the memory
+  // context has not frozen yet must fall back to the live language rather than
+  // returning undefined — reading `memoryLang.get(scope)` unguarded throws a
+  // TypeError and takes the whole prompt assembly down.
+  assert.equal(en.text({ scope: {} }), I.LOOP_AWARE_TEXT.en.join('\n'), 'an unfrozen scope falls back')
+  assert.equal(zh.text({ scope: {} }), I.LOOP_AWARE_TEXT.zh.join('\n'), 'an unfrozen scope falls back in zh too')
 })
 
-test('the review runner passes its language to every renderer', () => {
-  // The transcript truncation marker reaches the model only through this call
-  // site. Reverting it to `eff` (no lang) restored the Chinese marker under the
-  // English transcript heading with the whole suite green.
-  const source = readFileSync(join(root, 'src/index.js'), 'utf8')
-  assert.ok(
-    source.includes('renderTranscript(messages, { ...eff, lang })'),
-    'the runner must pass its per-run language to renderTranscript',
-  )
-  assert.ok(
-    /const lang = language\(\)/.test(source),
-    'the runner must resolve one language per review run',
-  )
-  // And the rendered result, with the language the runner would pass.
+test('the section and the frozen snapshot agree within one session', () => {
+  // The scope branch above only covers the fallback. Here the session actually
+  // freezes: the memory context renders first, then the section is asked for the
+  // same scope after the language changed. Both must keep the session's language,
+  // otherwise one session carries two languages.
+  let preference = 'zh'
+  let update = null
+  const sections = [], contexts = []
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    settings: { describe: () => [{ ns: 'locale', value: { preference } }] },
+    systemPrompt: {
+      section: (x) => { sections.push(x); return () => {} },
+      context: (x) => { contexts.push(x); return () => {} },
+    },
+    effect: (fn) => fn(),
+    on: (ev, h) => { if (ev === 'settings/document-updated') update = h; return () => {} },
+    get: () => undefined,
+  }
+  ctx.plugin = plugin
+  plugin.apply(ctx)
+  const section = sections.find((x) => x.name === 'hermes:loop-aware')
+  const memory = contexts.find((x) => x.name === 'hermes:memory')
+  const scope = {}
+
+  assert.match(memory.text({ scope }), /^# 长期记忆/, 'the session snapshot starts in zh')
+  preference = 'en'
+  update('locale')
+  assert.equal(section.text({ scope }), I.LOOP_AWARE_TEXT.zh.join('\n'),
+    'the section keeps the language the session froze')
+  assert.match(memory.text({ scope }), /^# 长期记忆/, 'the frozen snapshot is unchanged')
+
+  // A new session picks up the new language on both surfaces.
+  const fresh = {}
+  assert.equal(section.text({ scope: fresh }), I.LOOP_AWARE_TEXT.en.join('\n'))
+  assert.match(memory.text({ scope: fresh }), /^# Long-term memory/)
+})
+
+test('the runner passes its language to every renderer', () => {
+  // The transcript marker reaches the model only through the runner's call, and
+  // the runner's call is not reachable from here — it needs a session, an agent,
+  // and the review pipeline. A source-text assertion for it is defeated by a
+  // comment containing the same string, and is blind to the resolved language
+  // value, so the wiring is covered end-to-end in test/loop.test.mjs instead.
+  // What is pinned here is the renderer contract the runner depends on.
   const long = Array.from({ length: 40 }, () => ({ role: 'user', content: 'y'.repeat(380) }))
   assert.match(I.renderTranscript(long, { lang: 'en' }), /^…\(earlier messages dropped; tail kept\)/)
   assert.match(I.renderTranscript(long, { lang: 'zh' }), /^…（早段已按保尾策略截断）/)

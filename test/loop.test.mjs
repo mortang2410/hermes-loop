@@ -1300,6 +1300,53 @@ async function runE2E(config, conclusionText) {
   return { home, oldHome, notices, t, followup }
 }
 
+test('e2e: an English preference puts English copy in the prompt the model receives', async () => {
+  // The review prompt is assembled by the runner, so its language can only be
+  // checked here rather than against the dictionaries. Asserting on a source-text
+  // match for the runner's call is defeated by a comment holding the same string
+  // and is blind to the resolved language, so this drives the real pipeline:
+  // mount a locale-bearing settings service, force the transcript past its
+  // truncation limit, and read the prompt that is actually sent.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-i18n-e2e-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const services = fakeServices('```json\n{"action":"nothing","rationale":"nothing worth keeping"}\n```')
+  services.settings = {
+    describe: () => [
+      { ns: 'hermes-loop', value: {} },
+      { ns: 'locale', value: { preference: 'en' } },
+    ],
+    update: async () => {},
+  }
+  const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+  // Enough messages to exceed DEFAULTS.maxTranscriptChars, so the truncation
+  // marker is actually emitted rather than skipped.
+  const many = Array.from({ length: 40 }, (_, i) => ({ role: 'user', content: `turn ${i} ` + 'm'.repeat(380) }))
+  const session = {
+    id: 'session-i18n-e2e',
+    header: {},
+    deriveMessages: () => many,
+    append: () => {},
+  }
+  try {
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 90))
+    const followup = services.created.find((c) => c && c.content)
+    assert.ok(followup, 'the review agent must have been sent a prompt')
+    const prompt = followup.content[0].text
+    assert.match(prompt, /You are the background review agent/, 'the English review prompt was sent')
+    assert.match(prompt, /## Session transcript \(tail-preserving truncation\)/, 'the English transcript heading was sent')
+    assert.match(prompt, /…\(earlier messages dropped; tail kept\)/, 'the English truncation marker was sent')
+    assert.ok(!/[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/.test(prompt),
+      'no CJK or full-width punctuation may reach an English prompt')
+  } finally {
+    for (const fn of t.cleanups) { try { fn() } catch {} }
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('memory e2e: skill=nothing with memory add writes USER.md, echoes a notice, injects entries into the review prompt', async () => {
   const conclusion = JSON.stringify({ action: 'nothing', rationale: 'no skill this time', memory: { action: 'add', store: 'user', text: 'user prefers terse answers', rationale: 'said 直接给答案' } })
   const { home, oldHome, notices, followup } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
