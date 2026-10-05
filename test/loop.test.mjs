@@ -1044,10 +1044,20 @@ test('review fix: project-level suspects are not injected (writer only knows the
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   try {
-    const services = fakeServices('```json\n{"action":"nothing"}\n```')
-    services.skills = {
-      snapshot: async () => ({ skills: [{ name: 'proj-skill', description: 'project scoped', resourceBase: { kind: 'directory', path: join(home, 'project', '.dsh', 'skills', 'proj-skill') }, invocation: { modelInvocable: true } }], complete: true }),
-    }
+    // The project-scoped row goes through the AGENT-scoped service, because that
+    // is the route that reaches the filesystem provider's user skills. Supplying
+    // it through the plugin ctx would take the partial fallback and misrepresent
+    // where a project skill actually appears (raised in review round 4).
+    //
+    // The file must EXIST on disk. Without it the later `readFile` throws and
+    // `continue`s before the globalRoot filter is reached, so the assertion held
+    // even with the filter deleted: it passed for the wrong reason (also found in
+    // round 4, by mutation).
+    const projDir = join(home, 'project', '.dsh', 'skills', 'proj-skill')
+    await mkdir(projDir, { recursive: true })
+    await writeFile(join(projDir, 'SKILL.md'), '---\nname: "proj-skill"\ndescription: "project scoped"\n---\n\nproject body\n')
+    const projRow = { name: 'proj-skill', description: 'project scoped', resourceBase: { kind: 'directory', path: projDir }, invocation: { modelInvocable: true } }
+    const services = fakeServices('```json\n{"action":"nothing"}\n```', { agentSkills: catalogService([projRow]) })
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
     const session = { id: 'session-proj', header: {}, deriveMessages: () => [{ role: 'user', content: 'used proj-skill here' }] }
     t.fire(session, completedTurn)
