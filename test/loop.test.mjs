@@ -1065,7 +1065,14 @@ test('review fix: project-level suspects are not injected (writer only knows the
     const followup = services.created.find((c) => c && c.content)
     const prompt = followup.content[0].text
     assert.ok(!prompt.includes('### suspect:'), 'project-level skill must not be injected as a suspect (patch would be guaranteed patch-missing)')
-    assert.ok(prompt.includes('proj-skill'), 'catalog listing still includes it')
+    // Assert the CATALOG LINE, not the bare name: the transcript above already
+    // contains "proj-skill", so `prompt.includes('proj-skill')` held even with the
+    // catalog text removed from the prompt, and proved nothing about listing
+    // (raised in review round 5). The catalog renders as `- <name>: <description>`.
+    assert.ok(
+      prompt.includes('- proj-skill: project scoped'),
+      'the catalog line must still list the project skill while its body is not injected',
+    )
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
