@@ -1337,6 +1337,10 @@ test('e2e: an English preference puts English copy in the prompt the model recei
     assert.match(prompt, /You are the background review agent/, 'the English review prompt was sent')
     assert.match(prompt, /## Session transcript \(tail-preserving truncation\)/, 'the English transcript heading was sent')
     assert.match(prompt, /…\(earlier messages dropped; tail kept\)/, 'the English truncation marker was sent')
+    // The artifact language, not just the protocol's own copy: this is the line
+    // whose absence let an `en` preference produce a fully Chinese skill.
+    assert.ok(prompt.includes(plugin.__internals.REVIEW_LANGUAGE_DIRECTIVE.en),
+      'the English prompt must pin the description/body language to English')
     assert.ok(!/[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/.test(prompt),
       'no CJK or full-width punctuation may reach an English prompt')
   } finally {

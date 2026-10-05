@@ -799,6 +799,17 @@ function curatorTransitions(records, usage, { now, staleDays, archiveDays }) {
 //
 // 按 lang 取整段协议文本。结构、信号清单、负面清单与 JSON 字段名逐行对齐——只换
 // 语言，不换语义，否则复盘 agent 的判定行为会随语言漂移。
+//
+// 协议本身的语言（即本段的语言）不等于产物语言：模型会跟着上下文漂移，实测在
+// preference=en 且协议全英文的一次复盘里写出了整篇中文 skill（当时目录里唯一的
+// skill 与记忆条目都是中文，模型顺着它们写）。所以产物语言必须显式钉住，且随同一
+// 份 lang 变化——协议换成哪种语言，description/body/memory.text/rationale 就必须
+// 用哪种语言。写明「与转写/目录/记忆的语言无关」是因为漂移源正是它们的语言。
+// 这两个串是 zh 分支相对上游 0.1.16 唯一的增量，parity 测试按「上游 + 本行」比对。
+const REVIEW_LANGUAGE_DIRECTIVE = {
+  zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写、技能目录或记忆条目本身用什么语言无关。',
+  en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.',
+}
 const REVIEW_PROMPT_TEXT = {
   zh: (memoryOn) => [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
@@ -865,6 +876,7 @@ const REVIEW_PROMPT_TEXT = {
     '```',
     'patch 时 body 必须基于注入的目标全文修改（保留正确内容，只改需要改的），不得凭空重写。',
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
+    REVIEW_LANGUAGE_DIRECTIVE.zh,
   ],
   en: (memoryOn) => [
     'You are the background review agent: analyze a transcript of a just-finished conversation and decide whether it holds experience worth distilling into a skill.',
@@ -931,6 +943,7 @@ const REVIEW_PROMPT_TEXT = {
     '```',
     'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
+    REVIEW_LANGUAGE_DIRECTIVE.en,
   ],
 }
 
@@ -996,7 +1009,8 @@ module.exports = {
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
     // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
-    REVIEW_PROMPT_TEXT, MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
+    REVIEW_PROMPT_TEXT, REVIEW_LANGUAGE_DIRECTIVE,
+    MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
   },
 
   apply(ctx, config = {}) {

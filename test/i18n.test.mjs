@@ -135,8 +135,22 @@ function upstreamLoopAware() {
 
 test('the default language is upstream 0.1.16, verified by running upstream', oracle, () => {
   // The load-bearing assertion: with no preference recorded, this change must
-  // produce exactly what the package it replaces produced. Comparing against
-  // upstream's own function catches any drift in the zh branch itself.
+  // produce what the package it replaces produced. Comparing against upstream's
+  // own function catches any drift in the zh branch itself.
+  //
+  // The zh branch is deliberately NOT byte-identical any more. It carries one
+  // added line, the output-language directive, because a review whose protocol
+  // was Chinese still wrote a Chinese skill for a user whose preference is `en`:
+  // the protocol's language does not pin the artifact's language, so the zh
+  // default needs the same explicit instruction the en branch has. Stripping
+  // exactly that line before comparing keeps the assertion as strong as it was:
+  // every other character is still required to match upstream exactly, so any
+  // real drift still fails here.
+  const stripDirective = (text) => {
+    const line = '\n' + I.REVIEW_LANGUAGE_DIRECTIVE.zh
+    assert.ok(text.endsWith(line), 'the zh prompt must end with the output-language directive')
+    return text.slice(0, -line.length)
+  }
   for (const eff of [
     { memoryEnabled: true, userProfileEnabled: true },
     { memoryEnabled: true, userProfileEnabled: false },
@@ -144,8 +158,12 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     { memoryEnabled: false, userProfileEnabled: false },
     {},
   ]) {
-    assert.equal(I.reviewPrompt(eff), upstream().reviewPrompt(eff), `zh output drifted from upstream for ${JSON.stringify(eff)}`)
-    assert.equal(I.reviewPrompt(eff, 'zh'), upstream().reviewPrompt(eff))
+    assert.equal(
+      stripDirective(I.reviewPrompt(eff)),
+      upstream().reviewPrompt(eff),
+      `zh output drifted from upstream for ${JSON.stringify(eff)}`,
+    )
+    assert.equal(stripDirective(I.reviewPrompt(eff, 'zh')), upstream().reviewPrompt(eff))
   }
 
   // The memory snapshot is injected into every session rather than only into the
@@ -172,7 +190,7 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   }
 
   // And assert undefined explicitly means zh, so no caller needs a sentinel.
-  assert.equal(I.reviewPrompt({}), upstream().reviewPrompt({}))
+  assert.equal(stripDirective(I.reviewPrompt({})), upstream().reviewPrompt({}))
 
   // The loop-aware section is injected into every session's system prompt and
   // upstream does not export it, so compare against the array it assembles —
@@ -357,6 +375,17 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
   }, 'the English review input copy changed')
+  // The directives are pinned verbatim, for the same reason as every other
+  // model-facing string here: `prompt.includes(directive)` reads the very
+  // constant that builds the prompt, so a wording edit that guts the
+  // instruction ("English.") still satisfies every containment assertion. The
+  // model obeys this text, so only a literal pin turns an unnoticed weakening
+  // of it into a failure. The zh side is pinned here too rather than against
+  // upstream, because upstream has no such line to compare against.
+  assert.deepEqual(I.REVIEW_LANGUAGE_DIRECTIVE, {
+    zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写、技能目录或记忆条目本身用什么语言无关。',
+    en: "Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user's language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.",
+  }, 'an output-language directive changed wording; update the pin only if the new wording still names its language and stays independent of the surrounding context')
   assert.deepEqual(I.LOOP_AWARE_TEXT.en, [
     '# Wrap-up distillation (the background learning loop is running)',
     '',
@@ -432,9 +461,10 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '```',
     'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
+    I.REVIEW_LANGUAGE_DIRECTIVE.en,
   ], 'the English review prompt changed')
   const enOff = I.REVIEW_PROMPT_TEXT.en(false)
-  assert.equal(enOff.length, 43, 'the English memory-off prompt must drop exactly the two memory blocks')
+  assert.equal(enOff.length, 44, 'the English memory-off prompt must drop exactly the two memory blocks')
   assert.ok(!enOff.some((l) => l.startsWith('## Memory')), 'no memory guidance section when memory is off')
   assert.ok(!enOff.some((l) => l.includes('"memory":')), 'no memory conclusion schema when memory is off')
   assert.deepEqual(
@@ -442,6 +472,50 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     ['## Division of labour', 'Processes, steps, pitfalls → skill. User profile/preference information is not distilled this round.', ''],
     'the English memory-off division-of-labour line must say memory is not distilled',
   )
+})
+
+test('each review prompt pins the artifact language to its own language', () => {
+  // The regression this guards: `preference=en` produced a fully Chinese skill,
+  // because the prompt localized the protocol's own copy but left the
+  // model-written `description`, `body`, `rationale`, and `memory.text`
+  // unconstrained. The model drifted toward the surrounding context, which held
+  // a Chinese skill catalog and Chinese memory entries. Pinning the protocol
+  // language is therefore not enough on its own; the artifact language must be
+  // stated, and it must follow the same `lang` as the rest of the prompt.
+  const eff = { memoryEnabled: true, userProfileEnabled: true }
+  for (const lang of ['zh', 'en']) {
+    const prompt = I.reviewPrompt(eff, lang)
+    const directive = I.REVIEW_LANGUAGE_DIRECTIVE[lang]
+    assert.ok(directive, `${lang}: no output-language directive is defined`)
+    assert.ok(prompt.includes(directive), `${lang}: the review prompt does not carry its language directive`)
+    // Position matters only in that it must be inside the protocol, after the
+    // contract the model is asked to fill in, not stranded in an earlier
+    // section where it reads as a statement about the transcript.
+    assert.ok(
+      prompt.indexOf(directive) > prompt.lastIndexOf('Body section convention'),
+      `${lang}: the language directive must follow the output protocol`,
+    )
+  }
+
+  // The two directives must differ, and each must name its own language: a copy
+  // that named the wrong one would silently invert the setting.
+  assert.notEqual(I.REVIEW_LANGUAGE_DIRECTIVE.zh, I.REVIEW_LANGUAGE_DIRECTIVE.en)
+  assert.match(I.REVIEW_LANGUAGE_DIRECTIVE.en, /English/, 'the en directive must name English')
+  assert.match(I.REVIEW_LANGUAGE_DIRECTIVE.zh, /中文/, 'the zh directive must name Chinese')
+  assert.ok(
+    !/English/.test(I.REVIEW_LANGUAGE_DIRECTIVE.zh),
+    'the zh directive must not name English',
+  )
+
+  // With memory off the artifact language still has to hold: `description`,
+  // `body`, and `rationale` remain in the contract.
+  for (const lang of ['zh', 'en']) {
+    assert.ok(
+      I.reviewPrompt({ memoryEnabled: false, userProfileEnabled: false }, lang)
+        .includes(I.REVIEW_LANGUAGE_DIRECTIVE[lang]),
+      `${lang}: the directive must survive the memory-off branch`,
+    )
+  }
 })
 
 test('no English surface leaks Chinese or fullwidth punctuation', () => {
