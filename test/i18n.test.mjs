@@ -363,6 +363,85 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '- When wrapping up, if you find that a **skill loaded in this session** is wrong, missing steps, or outdated: fix it **immediately with your own tools** rather than leaving it to the background review (the background review will also catch it, but your context here is the most complete one).',
     '- Leave all other distillation (new skills, lessons learned) to the background learning loop. **Do not** proactively write new skill files — two competing sets of instructions would fight each other.',
   ], 'the English loop-aware copy changed')
+
+  // The English review prompt is the largest model-facing surface and is pinned
+  // here for the same reason as the dictionaries: the model obeys this text, and
+  // `parseConclusion` reads the keys it names. Renaming `rationale` in the
+  // English prompt while the parser still reads `rationale` would turn every
+  // English review into a silent no-op, with the suite green.
+  //
+  // Changing English wording means editing here too. That is the cost of having
+  // no upstream English to compare against; the zh branch is pinned against the
+  // real 0.1.16 functions instead and has no equivalent duplication.
+  assert.deepEqual(I.REVIEW_PROMPT_TEXT.en(true), [
+    'You are the background review agent: analyze a transcript of a just-finished conversation and decide whether it holds experience worth distilling into a skill.',
+    '',
+    '## Lean toward acting',
+    'Be ACTIVE — most conversations are worth at least one small update. Doing nothing is not a neutral outcome; it is a missed learning opportunity.',
+    '',
+    '## Positive signals (act if any holds)',
+    '1. The user corrected style/tone/format/verbosity ("stop doing X" / "too verbose" / "just give me the answer") — this is a FIRST-CLASS signal;',
+    '2. The user corrected the workflow or the order of steps;',
+    '3. A non-trivial technique, fix, workaround, debugging path, or tool usage appeared;',
+    '4. An injected existing skill was found wrong, incomplete, or outdated → PATCH it immediately.',
+    '',
+    '## Negative list (never distill these)',
+    '- Environment dependency failures (missing binary, unconfigured credentials — things the user can fix themselves);',
+    '- Negative assertions about tools ("X is broken" hardens into a permanent refusal);',
+    '- Transient errors already resolved within the session (what is worth storing is the retry pattern, not the failure itself);',
+    '- One-off task narrative (it does not constitute a category of work);',
+    '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
+    '',
+    '## Priority order',
+    '1. PATCH a skill that appeared in the transcript and whose full text was injected;',
+    '2. PATCH an existing class-level umbrella skill (see the catalog below);',
+    '3. Only when neither covers it, CREATE a new skill.',
+    '',
+    '## Naming discipline',
+    'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
+    "If the name only makes sense for today's task, it is wrong — go back to priority 1/2 and extend an existing skill instead.",
+    '',
+    '## Memory (optional conclusion — most reviews should produce none)',
+    'Besides skills, consider writing memory only when the conversation **explicitly** surfaced:',
+    '- user profile, preferences, expectations about how you behave → store="user";',
+    '- environment/project facts, conventions, lessons (e.g. "releases require OTP", "the service runs on port 19080") → store="memory";',
+    '- processes, steps, pitfalls → these remain skills; never write them into memory.',
+    'Produce on demand: if nothing is clearly worth keeping, omit the memory field — do not write for the sake of writing. The memory stores are small, tightly-curated lists; mediocre entries crowd out real ones, while a missed entry costs almost nothing.',
+    'When a store nears its limit, prefer replace (merge and rewrite an existing entry) or remove (drop a stale entry) over add.',
+    '',
+    '## Division of labour',
+    'Processes, steps, pitfalls → skill; environment facts/conventions/lessons and user profile → memory (rules above).',
+    '',
+    '## Output protocol (strictly obey)',
+    'Output one fenced JSON code block and nothing else:',
+    '```json',
+    '{ "action": "nothing" | "create" | "patch",',
+    '  "skill": "kebab-case-name",            // required for create/patch',
+    '  "description": "≤500 characters",       // required for create',
+    '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
+    '  "baseHash": "<echo the injected suspect baseHash verbatim>",  // required for patch',
+    '  "baseDescription": "<echo the injected suspect description verbatim>",  // required for patch',
+    '  "rationale": "One sentence: why it is worth storing, or why not",',
+    '  "memory": {                            // optional; most reviews should omit the whole field',
+    '    "action": "nothing" | "add" | "replace" | "remove",',
+    '    "store": "memory" | "user",           // required for add/replace/remove',
+    '    "text": "New entry, one sentence (required for add/replace)",',
+    '    "oldText": "A substring of the original text that uniquely matches one entry in the memory list below (required for replace/remove)",',
+    '    "rationale": "Why record / change / delete" }',
+    '}',
+    '```',
+    'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
+    'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
+  ], 'the English review prompt changed')
+  const enOff = I.REVIEW_PROMPT_TEXT.en(false)
+  assert.equal(enOff.length, 43, 'the English memory-off prompt must drop exactly the two memory blocks')
+  assert.ok(!enOff.some((l) => l.startsWith('## Memory')), 'no memory guidance section when memory is off')
+  assert.ok(!enOff.some((l) => l.includes('"memory":')), 'no memory conclusion schema when memory is off')
+  assert.deepEqual(
+    enOff.slice(26, 29),
+    ['## Division of labour', 'Processes, steps, pitfalls → skill. User profile/preference information is not distilled this round.', ''],
+    'the English memory-off division-of-labour line must say memory is not distilled',
+  )
 })
 
 test('no English surface leaks Chinese or fullwidth punctuation', () => {
@@ -395,6 +474,63 @@ test('no English surface leaks Chinese or fullwidth punctuation', () => {
     'the zh transcript marker must stay byte-identical to the historical text')
   assert.match(I.renderTranscript(long, { lang: 'en' }), /^…\(earlier messages dropped; tail kept\)/,
     'the English transcript must carry its own marker')
+})
+
+// A minimal stand-in for the parts of the host context `apply` touches. The
+// provider wiring is only reachable through `apply`, so testing the dictionaries
+// directly cannot prove the runner passes the right language to each renderer.
+function hostContext({ preference = 'en', unset = false } = {}) {
+  const sections = [], contexts = []
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    settings: { describe: () => [{ ns: 'locale', value: unset ? {} : { preference } }] },
+    systemPrompt: {
+      section: (s) => { sections.push(s); return () => {} },
+      context: (c) => { contexts.push(c); return () => {} },
+    },
+    effect: (fn) => fn(),
+    on: () => () => {},
+    get: () => undefined,
+  }
+  ctx.plugin = plugin
+  plugin.apply(ctx)
+  return {
+    section: (name) => sections.find((s) => s.name === name),
+    context: (name) => contexts.find((c) => c.name === name),
+  }
+}
+
+test('the loop-aware section provider renders the chosen language', () => {
+  // Forcing the provider to zh would leave an English-preference user with
+  // Chinese discipline instructions and no test failure, because every previous
+  // assertion read LOOP_AWARE_TEXT.en directly instead of calling the provider.
+  const en = hostContext({ preference: 'en' }).section('hermes:loop-aware')
+  assert.equal(en.text(), I.LOOP_AWARE_TEXT.en.join('\n'))
+  assert.equal(en.text(), I.LOOP_AWARE_TEXT.en.join('\n'), 'the provider is stable across calls')
+
+  const zh = hostContext({ unset: true }).section('hermes:loop-aware')
+  assert.equal(zh.text(), I.LOOP_AWARE_TEXT.zh.join('\n'))
+})
+
+test('the review runner passes its language to every renderer', () => {
+  // The transcript truncation marker reaches the model only through this call
+  // site. Reverting it to `eff` (no lang) restored the Chinese marker under the
+  // English transcript heading with the whole suite green.
+  const source = readFileSync(join(root, 'src/index.js'), 'utf8')
+  assert.ok(
+    source.includes('renderTranscript(messages, { ...eff, lang })'),
+    'the runner must pass its per-run language to renderTranscript',
+  )
+  assert.ok(
+    /const lang = language\(\)/.test(source),
+    'the runner must resolve one language per review run',
+  )
+  // And the rendered result, with the language the runner would pass.
+  const long = Array.from({ length: 40 }, () => ({ role: 'user', content: 'y'.repeat(380) }))
+  assert.match(I.renderTranscript(long, { lang: 'en' }), /^…\(earlier messages dropped; tail kept\)/)
+  assert.match(I.renderTranscript(long, { lang: 'zh' }), /^…（早段已按保尾策略截断）/)
+  // No lang at all must stay on the historical text, never invent English.
+  assert.match(I.renderTranscript(long, {}), /^…（早段已按保尾策略截断）/)
 })
 
 test('an absent locale row costs nothing once the retry budget is spent', () => {
