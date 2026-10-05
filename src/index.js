@@ -438,16 +438,20 @@ function sha256(text) {
  * (packages/dsh-skill-router/src/index.ts, "The catalog MUST be read through an
  * agent context, not this plugin's own").
  *
- * `complete` does NOT detect this: every partial read reports `complete: true`,
- * so it cannot be used as a guard. Only the row count reveals it.
+ * `complete` does NOT detect the missing-scope problem: a scope-limited read
+ * reports `complete: true`, because each provider answered in full. It does
+ * report a DIFFERENT shortfall, a provider that threw or returned an incomplete
+ * observation (`dsh-skill`, listLayerCandidates sets cacheable=false on either),
+ * so the caller treats `complete: false` as "this catalog may be missing rows"
+ * and withholds skill conclusions while still letting the memory channel run.
  *
  * The agent-scoped service is preferred in two places because they populate at
  * different moments: `scoped` is captured synchronously from the `setup`
  * callback (which receives the agent context directly), and `agent.ctx` is the
- * documented agent-scoped context. Falling back to the plugin's own service
- * keeps the review running, but that read is the partial one, so the result
- * carries `via` and the caller traces it: a blind catalog must never be
- * mistaken for a small library.
+ * documented agent-scoped context, which may be the only route when setup sees
+ * no service. Falling back to the plugin's own service keeps the review running,
+ * but that read is the partial one, so the result carries `via` and the caller
+ * traces it: a blind catalog must never be mistaken for a small library.
  *
  * @param {object} agent The review agent, whose `ctx` carries the scoped registry.
  * @param {object} ctx The plugin context, used only for the fallback read.
@@ -1540,7 +1544,21 @@ module.exports = {
           ? catalog.map((s) => `- ${s.name}: ${s.description}`).join('\n')
           : REVIEW_INPUT_TEXT[lang].emptyCatalog
         const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
-        trace('review-inputs', { sessionId, messages: messages.length, catalogSize: catalog.length, catalogVia: snapshot.via, suspects: suspects.map((s) => s.name) })
+        // A snapshot can be incomplete because a provider threw or returned a
+        // partial observation (dsh-skill sets cacheable=false on either). Such a
+        // catalog may be missing the very skill this review should patch, so a
+        // skill conclusion drawn from it is not trustworthy. `complete` cannot
+        // detect the missing-scope case, which is why `via` is traced too: the
+        // two flags catch different shortfalls.
+        const catalogComplete = snapshot.complete !== false
+        trace('review-inputs', {
+          sessionId,
+          messages: messages.length,
+          catalogSize: catalog.length,
+          catalogVia: snapshot.via,
+          catalogComplete,
+          suspects: suspects.map((s) => s.name),
+        })
         const suspectBlocks = []
         const globalRoot = globalSkillsDir() + sep
         for (const suspect of suspects) {
@@ -1654,6 +1672,17 @@ module.exports = {
         if (conclusion.action === 'nothing' && !hasMemoryAction) {
           ctx.logger.info(`hermes-loop: review of session ${sessionId} → nothing. ${conclusion.rationale}`)
           return
+        }
+        // An incomplete catalog can hide the skill this review should have
+        // patched, so a skill conclusion is withheld. The memory channel does not
+        // read the skill catalog and is unaffected, so it still runs.
+        if (!catalogComplete && conclusion.action !== 'nothing') {
+          ctx.logger.warn(`hermes-loop: review of session ${sessionId} returned ${conclusion.action} '${conclusion.skill}' but the catalog was incomplete (via=${snapshot.via}, rows=${catalog.length}); skill conclusion withheld`)
+          if (!hasMemoryAction) return
+          conclusion.action = 'nothing'
+          delete conclusion.skill
+          delete conclusion.body
+          delete conclusion.description
         }
         await dispatchConclusion(conclusion, { eff, sessionId, session })
       } catch (e) {

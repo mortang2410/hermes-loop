@@ -155,7 +155,7 @@ test('applyConclusion: patch passes CAS when unchanged, fails when file drifted'
 
 // ── end-to-end through apply(): fake services drive a full review ───────
 
-function fakeServices(conclusionText, { agentSkills } = {}) {
+function fakeServices(conclusionText, { agentSkills, setupHasSkills = true, agentHasSkills = true } = {}) {
   const created = []
   const agent = {
     session: {
@@ -169,13 +169,18 @@ function fakeServices(conclusionText, { agentSkills } = {}) {
   // The review agent's OWN ctx is what carries the full catalog: a plugin's
   // `ctx.skills` resolves only to its include subtree's sibling registrations.
   // `tools` is present because `setup` always calls `agentCtx.tools.restrict`.
-  // The setup context is held separately from `agent.ctx` so a test can exercise
-  // the setup seam alone, with the agent exposing no `ctx` at all.
+  //
+  // The setup context and the agent context are DIFFERENT objects with
+  // independent switches. Using one object for both made the two routes
+  // indistinguishable: hiding skills from setup also hid them from `agent.ctx`,
+  // so the secondary lookup could never be exercised (found in review round 1).
   const setupCtx = {
-    get: (name) => (name === 'skills' ? agentSkills : undefined),
+    get: (name) => (name === 'skills' && setupHasSkills ? agentSkills : undefined),
     tools: { restrict() {} },
   }
-  if (agentSkills !== undefined) agent.ctx = setupCtx
+  if (agentSkills !== undefined) {
+    agent.ctx = { get: (name) => (name === 'skills' && agentHasSkills ? agentSkills : undefined) }
+  }
   return {
     created,
     agent,
@@ -1132,9 +1137,8 @@ test('review fix: the setup callback alone is enough to scope the catalog read',
       invocation: { modelInvocable: true },
     }))
     const agentSkills = { snapshot: async () => ({ skills: fullCatalog, complete: true }) }
-    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', { agentSkills })
-    // Strip the agent's own ctx so the setup-captured service is the only route.
-    delete services.agent.ctx
+    // The agent exposes NO skills service, so the setup capture is the only route.
+    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', { agentSkills, agentHasSkills: false })
     services.skills = {
       snapshot: async () => ({ skills: [{ name: 'sibling-only', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
     }
@@ -1152,6 +1156,86 @@ test('review fix: the setup callback alone is enough to scope the catalog read',
   }
 })
 
+test('review fix: the agent.ctx lookup is the route when setup sees no skills service', async () => {
+  // The secondary route. Removing the `agent.ctx.get('skills')` lookup in
+  // readCatalogFor left all other tests green, because the setup capture always
+  // answered first in them. Here setup is blind to skills while the agent
+  // context exposes one, so only the secondary lookup can reach the full catalog.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-agentctx-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const fullCatalog = Array.from({ length: 9 }, (_, i) => ({
+      name: `agentctx-skill-${i}`,
+      description: `skill ${i} about deploys`,
+      invocation: { modelInvocable: true },
+    }))
+    const agentSkills = { snapshot: async () => ({ skills: fullCatalog, complete: true }) }
+    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', {
+      agentSkills,
+      setupHasSkills: false,
+    })
+    services.skills = {
+      snapshot: async () => ({ skills: [{ name: 'sibling-only', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+    const session = { id: 'session-catalog-agentctx', header: {}, deriveMessages: () => [{ role: 'user', content: 'deploy' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    const prompt = services.created.find((c) => c && c.content).content[0].text
+    assert.ok(prompt.includes('agentctx-skill-8'), 'the agent.ctx lookup must supply the catalog when setup saw none')
+    assert.ok(!prompt.includes('sibling-only'), 'the partial view must not be used')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: an incomplete catalog withholds a skill conclusion but keeps memory', async () => {
+  // `complete: false` means a provider threw or returned a partial observation,
+  // so the catalog may be missing the very skill this review should patch. The
+  // skill conclusion must be withheld; the memory channel does not read the
+  // catalog and must still land.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-catalog-incomplete-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    await mkdir(join(home, 'hermes-loop'), { recursive: true })
+    const conclusion = JSON.stringify({
+      action: 'create', skill: 'should-not-land', description: 'd', body: '# b',
+      rationale: 'r',
+      memory: { action: 'add', store: 'memory', text: 'the port is 3080', rationale: 'r' },
+    })
+    const services = fakeServices('```json\n' + conclusion + '\n```')
+    services.skills = {
+      snapshot: async () => ({ skills: [{ name: 'partial-skill', description: 'd', invocation: { modelInvocable: true } }], complete: false }),
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-incomplete', header: {}, deriveMessages: () => [{ role: 'user', content: 'deploy' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 150))
+
+    // The skill must not be written.
+    let wrote = true
+    try { await readFile(join(home, 'skills', 'should-not-land', 'SKILL.md'), 'utf8') } catch { wrote = false }
+    assert.equal(wrote, false, 'an incomplete catalog must withhold the skill conclusion')
+
+    // The memory channel is independent and must still have run.
+    const mem = await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8')
+    assert.match(mem, /the port is 3080/, 'the memory channel must survive an incomplete catalog')
+
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogComplete, false, 'the trace must record the incomplete catalog')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('review fix: a host with no agent-scoped skills service falls back and says so', async () => {
   // The fallback keeps a review running on a host that exposes no scoped
   // context, but the read is the partial one. The trace must name it, because a
@@ -1162,6 +1246,7 @@ test('review fix: a host with no agent-scoped skills service falls back and says
   process.env.DSH_HOME = home
   try {
     const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```')
+    // Hide the service from BOTH routes: no agent-scoped skills at all.
     delete services.agent.ctx
     services.skills = {
       snapshot: async () => ({ skills: [{ name: 'only-skill', description: 'partial', invocation: { modelInvocable: true } }], complete: true }),
