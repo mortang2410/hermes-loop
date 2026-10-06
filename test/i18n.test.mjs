@@ -9,7 +9,8 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -649,37 +650,53 @@ test('the section and the frozen snapshot agree within one session', () => {
   // freezes: the memory context renders first, then the section is asked for the
   // same scope after the language changed. Both must keep the session's language,
   // otherwise one session carries two languages.
-  let preference = 'zh'
-  let update = null
-  const sections = [], contexts = []
-  const ctx = {
-    logger: { info() {}, warn() {}, error() {} },
-    settings: { describe: () => [{ ns: 'locale', value: { preference } }] },
-    systemPrompt: {
-      section: (x) => { sections.push(x); return () => {} },
-      context: (x) => { contexts.push(x); return () => {} },
-    },
-    effect: (fn) => fn(),
-    on: (ev, h) => { if (ev === 'settings/document-updated') update = h; return () => {} },
-    get: () => undefined,
+  //
+  // renderMemoryContext returns '' when every store has zero entries, so the zh
+  // heading asserted below only appears if MEMORY.md holds at least one entry.
+  // Point DSH_HOME at a temp fixture so the test does not depend on the
+  // developer's real ~/.dsh/memory/MEMORY.md (which is absent on CI runners).
+  const home = mkdtempSync(join(tmpdir(), 'hermes-i18n-snap-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    mkdirSync(join(home, 'memory'), { recursive: true })
+    writeFileSync(join(home, 'memory', 'MEMORY.md'), '§ i18n fixture entry\n')
+    let preference = 'zh'
+    let update = null
+    const sections = [], contexts = []
+    const ctx = {
+      logger: { info() {}, warn() {}, error() {} },
+      settings: { describe: () => [{ ns: 'locale', value: { preference } }] },
+      systemPrompt: {
+        section: (x) => { sections.push(x); return () => {} },
+        context: (x) => { contexts.push(x); return () => {} },
+      },
+      effect: (fn) => fn(),
+      on: (ev, h) => { if (ev === 'settings/document-updated') update = h; return () => {} },
+      get: () => undefined,
+    }
+    ctx.plugin = plugin
+    plugin.apply(ctx)
+    const section = sections.find((x) => x.name === 'hermes:loop-aware')
+    const memory = contexts.find((x) => x.name === 'hermes:memory')
+    const scope = {}
+
+    assert.match(memory.text({ scope }), /^# 长期记忆/, 'the session snapshot starts in zh')
+    preference = 'en'
+    update('locale')
+    assert.equal(section.text({ scope }), I.LOOP_AWARE_TEXT.zh.join('\n'),
+      'the section keeps the language the session froze')
+    assert.match(memory.text({ scope }), /^# 长期记忆/, 'the frozen snapshot is unchanged')
+
+    // A new session picks up the new language on both surfaces.
+    const fresh = {}
+    assert.equal(section.text({ scope: fresh }), I.LOOP_AWARE_TEXT.en.join('\n'))
+    assert.match(memory.text({ scope: fresh }), /^# Long-term memory/)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    rmSync(home, { recursive: true, force: true })
   }
-  ctx.plugin = plugin
-  plugin.apply(ctx)
-  const section = sections.find((x) => x.name === 'hermes:loop-aware')
-  const memory = contexts.find((x) => x.name === 'hermes:memory')
-  const scope = {}
-
-  assert.match(memory.text({ scope }), /^# 长期记忆/, 'the session snapshot starts in zh')
-  preference = 'en'
-  update('locale')
-  assert.equal(section.text({ scope }), I.LOOP_AWARE_TEXT.zh.join('\n'),
-    'the section keeps the language the session froze')
-  assert.match(memory.text({ scope }), /^# 长期记忆/, 'the frozen snapshot is unchanged')
-
-  // A new session picks up the new language on both surfaces.
-  const fresh = {}
-  assert.equal(section.text({ scope: fresh }), I.LOOP_AWARE_TEXT.en.join('\n'))
-  assert.match(memory.text({ scope: fresh }), /^# Long-term memory/)
 })
 
 test('the runner passes its language to every renderer', () => {
