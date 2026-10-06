@@ -1347,7 +1347,14 @@ test('e2e: an English preference puts English copy in the prompt the model recei
     for (const fn of t.cleanups) { try { fn() } catch {} }
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
-    await rm(home, { recursive: true, force: true })
+    // The activity journal is written fire-and-forget (mkdir → appendFile, not
+    // awaited at the call site). A write armed during the review can land while
+    // rm() is tearing the temp home down, recreating `<home>/hermes-loop/` and
+    // surfacing ENOTEMPTY. Retry a few times on that race; anything else rethrows.
+    for (let attempt = 0; ; attempt++) {
+      try { await rm(home, { recursive: true, force: true }); break }
+      catch (e) { if (e.code !== 'ENOTEMPTY' || attempt >= 4) throw e; await new Promise((r) => setTimeout(r, 25)) }
+    }
   }
 })
 
