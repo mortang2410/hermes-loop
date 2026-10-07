@@ -426,50 +426,229 @@ function sha256(text) {
 }
 
 /**
- * Read the skill catalog for a review, through the review agent's own context.
+ * Read the skill catalog for a review.
  *
  * A plugin's injected `ctx.skills` resolves to the registry of the include
  * subtree that plugin row mounts in, which holds ONLY sibling runtime
  * registrations (the office skills, vision-skills) and none of the filesystem
  * provider's user skills. Measured on this host: a plugin-ctx read returns 3
- * rows while the catalog holds 426, and the row count never grows as the
- * library does. Reading through an agent context is what returns the full set;
- * this is the same defect the skill-router documents and fixes the same way
- * (packages/dsh-skill-router/src/index.ts, "The catalog MUST be read through an
- * agent context, not this plugin's own", which resolves the service with
- * `agent.ctx?.get('skills')`).
+ * rows while the catalog holds 400+. Reading through an agent context is what
+ * returns the full set; this is the same defect the skill-router documents and
+ * fixes the same way (packages/dsh-skill-router/src/index.ts, "The catalog MUST
+ * be read through an agent context, not this plugin's own").
  *
- * There is exactly ONE agent context, not two. The host runs
- * `setup?.(prepared.agent.ctx, prepared.agent)` and later returns that same
- * agent from `publish` (dsh-agent-loop/lib/index.js), so the context handed to
- * `setup` IS `agent.ctx`. Capturing the service in `setup` and then reading
- * `agent.ctx` again would be the same lookup twice; this reads it once, after
- * creation, which is also where the host guarantees the scope is minted.
+ * Which agent matters, and this is the part that is easy to get wrong. Reading
+ * through an agent context is necessary but NOT sufficient: `snapshot({ scope })`
+ * merges the global layer plus the scope CHAIN (`dsh-skill/lib/index.js:299`,
+ * `[this.layers.global, ...this.layers.chainLayers(options.scope)]`), and only an
+ * agent that JOINED a preset has the preset's rows in that chain. The host links
+ * the two by calling `presets.mount(agentCtx, presetId)` inside an agent's
+ * `setup` (dsh-api-session-controller/lib/index.js:368,
+ * dsh-webhook/lib/index.js:172). Passing `meta: { agentPreset }` records an
+ * identity in the session header and performs no mount, and neither
+ * `dsh-agent/lib/index.js` nor `dsh-agent-loop/lib/index.js` mentions presets at
+ * all.
  *
- * A snapshot can be short in two independent ways, and each needs its own flag:
- *  - `complete: false` — a provider threw or returned a partial observation
- *    (`dsh-skill`, listLayerCandidates sets cacheable=false on either).
- *  - `via: 'plugin-ctx'` — no agent-scoped service was available, so this is the
- *    partial sibling registry. It still reports `complete: true`, because every
- *    provider it asked answered in full, so `complete` alone cannot catch it.
- * The caller withholds skill conclusions when EITHER says the catalog is short.
+ * So the review agent, which this plugin creates itself, carries an agent-scoped
+ * context whose chain has no filesystem provider: its read is genuinely scoped,
+ * genuinely `complete: true`, and returns one runtime row. The triggering
+ * session's agent is the one the host composed and mounted, so it is read first.
  *
- * @param {object} agent The review agent, whose `ctx` carries the scoped registry.
- * @param {object} ctx The plugin context, used only for the fallback read.
+ * @param {{sessionAgent?: object, reviewAgent?: object, ctx: object}} sources
+ *   The agents to try, in order, plus the plugin context for the last-resort read.
  * @param {{cwd?: string, signal?: AbortSignal}} opts Lookup options.
- * @returns {Promise<object>} The snapshot, plus `via`: 'agent-ctx' | 'plugin-ctx'.
+ * @returns {Promise<object>} The snapshot, plus `via`: which scope answered.
  */
-async function readCatalogFor(agent, ctx, { cwd, signal } = {}) {
-  let service
+/** Provider name `dsh-skill` stamps on runtime registrations (`RUNTIME_PROVIDER`). */
+const RUNTIME_PROVIDER_NAME = 'runtime'
+/** Module specifier of the skill provider a preset must mount for a full catalog. */
+const REQUIRED_SKILL_PROVIDER = '@deepseek-ai/dsh-skill-filesystem'
+/** Cordis fiber state meaning "loaded and providing" (`FiberState.ACTIVE`). */
+const FIBER_ACTIVE = 2
+
+/** The skills registry a live agent's own context resolves, or undefined. */
+function skillsServiceOf(agent) {
   try {
-    service = agent && agent.ctx && typeof agent.ctx.get === 'function' ? agent.ctx.get('skills') : undefined
-  } catch { service = undefined }
-  if (service && typeof service.snapshot === 'function') {
-    const snapshot = await service.snapshot({ cwd, signal, scope: agent })
-    return { ...snapshot, via: 'agent-ctx' }
+    return agent && agent.ctx && typeof agent.ctx.get === 'function' ? agent.ctx.get('skills') : undefined
+  } catch { return undefined }
+}
+
+/**
+ * Structurally establish whether `agent`'s scope can reach a live skill provider.
+ *
+ * Row labels CANNOT answer this, which is why this check exists. A catalog that
+ * came back providerless and `complete: true` looks identical to a library that
+ * merely holds no skills, and a provider row that is mounted but disabled still
+ * answers `complete: true`. The only sound evidence is the composition itself.
+ *
+ * Two host APIs supply it, both public
+ * (`dsh-agent-preset-registry/lib/types/index.d.ts:95`, `:126`):
+ *  - `composedPreset(agent.ctx)` returns the preset an agent joined, or
+ *    `undefined` when it joined none. It works by matching the agent scope's
+ *    PARENT key against live standing mounts, so it is true negative evidence:
+ *    an agent with no preset has no parent link at all
+ *    (`dsh-agent-preset-registry/lib/index.js:147-156`).
+ *  - `compositionInventory()` reports every preset's rows with `moduleName`,
+ *    `enabled`, and `fiberState` (`mountedCompositionRows`, same file `:360-375`).
+ *    The skill provider row must be `enabled` and `ACTIVE` (state 2,
+ *    `cordis/lib/types/fiber.d.ts:70`).
+ *
+ * Returns a named verdict rather than a boolean, because it can prove a POSITIVE
+ * and never a negative, and the caller acts on exactly that asymmetry:
+ *  - `'active'`          the agent's preset carries an enabled, ACTIVE skill
+ *                        provider row. A catalog read through this agent merged a
+ *                        discovery provider, so the row-label arm is not consulted.
+ *  - `'no-preset'`       the agent joined no preset. NOT evidence of a missing
+ *                        provider: the global layer is always merged (see below).
+ *  - `'provider-absent'` the joined preset names no skill provider row. Also not
+ *                        evidence, for the same reason.
+ *  - `'provider-inactive'` the row exists but is disabled or not ACTIVE.
+ *  - `'malformed'`       the inventory answered with rows this code cannot read.
+ *  - `'unprovable'`      the host exposes no preset registry.
+ * Every verdict other than `'active'` means "could not establish health", which
+ * sends the caller to the row-label arm rather than shorting the catalog outright.
+ *
+ * What this proof CANNOT establish, and must not be read as establishing: that a
+ * provider returned ZERO rows. `snapshot()` reports provider names per ROW, so a
+ * provider that found nothing is invisible; no public API enumerates the
+ * providers behind a scoped read. A host with the only filesystem provider on the
+ * GLOBAL plane (`dsh-base/cordis.patch.yml:297`, which the web bundle disables in
+ * favour of presets) is the standing counterexample to treating `'no-preset'` as
+ * a verdict of absence.
+ *
+ * KNOWN CEILING, not an oversight: the inventory reports the CURRENT definition's
+ * generation (`dsh-agent-preset-registry/lib/index.js:805` reads
+ * `record.generation`), while `composedPreset` names the generation the agent
+ * actually joined. An agent held on an older revision of a same-id preset could
+ * therefore be authenticated by the newer revision's active row. It is left
+ * unfixed because a second generation for one id is not reachable on a running
+ * host: `register()` rejects a duplicate id (same file `:503`), the declarative
+ * preset row registers once at startup (`dsh-agent-preset/lib/index.js:24-26`),
+ * live HMR is disabled in this profile (`~/.dsh/profiles/web/cordis.patch.yml:339`),
+ * and `select()` refuses to rebind a session whose first turn has started
+ * (`dsh-agent-preset-registry/lib/index.js:755-758`). The registry exposes no API
+ * that returns the joined generation, so no sound fix exists from here; closing it
+ * would need a host change.
+ *
+ * @param {object} ctx Plugin context, used only to reach the preset registry.
+ * @param {object} agent The agent whose scope was read.
+ * @returns {Promise<string>} One of the six verdicts above.
+ */
+async function providerProofOf(ctx, agent) {
+  try {
+    let presets
+    try {
+      presets = ctx && typeof ctx.get === 'function' ? ctx.get('agentPresets', false) : undefined
+    } catch { return 'unprovable' }
+    if (presets === undefined || typeof presets.composedPreset !== 'function' || typeof presets.compositionInventory !== 'function') {
+      return 'unprovable'
+    }
+    let presetId
+    try { presetId = presets.composedPreset(agent && agent.ctx) } catch { return 'unprovable' }
+    if (presetId === undefined) return 'no-preset'
+    let inventory
+    try { inventory = await presets.compositionInventory() } catch { return 'unprovable' }
+    const entry = (Array.isArray(inventory) ? inventory : []).find((p) => p && p.id === presetId)
+    if (entry === undefined || !Array.isArray(entry.rows)) return 'unprovable'
+    // Row inspection defends itself: a non-conforming inventory object can expose
+    // a throwing accessor, and a proof that aborts the review is worse than one
+    // that reports it could not tell.
+    const row = entry.rows.find((r) => r && r.moduleName === REQUIRED_SKILL_PROVIDER)
+    if (row === undefined) return 'provider-absent'
+    if (row.enabled !== true) return 'provider-inactive'
+    // Exact match, not "any defined state": the host omits `fiberState` when the
+    // row has no fiber (`dsh-agent-preset-registry/lib/index.js:371`), and a row
+    // with no live fiber is not a provider that answered.
+    if (row.fiberState !== FIBER_ACTIVE) return 'provider-inactive'
+    return 'active'
+  } catch { return 'malformed' }
+}
+
+/**
+ * Whether a NON-EMPTY snapshot was answered entirely by runtime registrations.
+ *
+ * This is the arm that catches the shipped defect, and it is evidence-based
+ * rather than absence-based, which is what makes it sound: rows DID come back and
+ * every one of them is a runtime registration, so no discovery provider answered
+ * the scope that was read. That is a positive observation about the rows in hand,
+ * not an inference from the composition being unreadable.
+ *
+ * Rows a runtime registration contributes are stamped `provider: 'runtime'`
+ * (`dsh-skill`, `register()` sets `provider: skill.provider ?? RUNTIME_PROVIDER`;
+ * the vision toolkit's `vision-skills` is registered exactly that way and carries
+ * no provider field of its own). Every discovered row carries its provider's own
+ * name (the filesystem provider stamps `filesystem`, the office one `dsh-office`).
+ * It is deliberately NOT a row count: a library holding one skill is healthy, and
+ * any threshold would call it short.
+ *
+ * An EMPTY snapshot is deliberately not flagged, and NOTHING here infers absence
+ * from emptiness. Emptiness cannot distinguish a scope with no provider from a
+ * library that genuinely holds no skills, so flagging it would make the first
+ * create on a fresh install impossible. The `active` structural proof is what
+ * makes an empty catalog trustworthy when a provider is known to be in scope; the
+ * `via: 'plugin-ctx'` arm covers the empty read that is knowably providerless.
+ *
+ * KNOWN CEILING, and it is a trade the host API forces. A discovery provider that
+ * answers ZERO rows leaves no row behind to stamp, so these two situations are
+ * byte-identical to every public API:
+ *   (a) no discovery provider was reachable at all (the shipped defect), and
+ *   (b) a provider WAS reachable and the library is simply empty, while a runtime
+ *       registration makes the snapshot nonempty.
+ * `snapshot()` returns only `{ skills, complete }`
+ * (`dsh-skill/lib/types/index.d.ts:152-157`), a zero-row provider contributes
+ * zero rows, and no API enumerates the providers behind a scoped read. So (b) is
+ * withheld here as if it were (a). The cost is bounded and self-healing: it
+ * affects only a host whose library has no provider-backed skill at all, and the
+ * arm stops firing the moment one exists. Closing it needs a host change, namely a
+ * field on `SkillCatalogSnapshot` reporting which providers participated in a
+ * scoped read. Withholding is the deliberate direction of this trade: a missed
+ * first create is recoverable, while a create drawn from a catalog missing the
+ * skill it should have matched is a silent duplicate.
+ *
+ * @param {object} snapshot A snapshot returned by `readCatalogFor`.
+ * @returns {boolean} true when rows came back but none from a discovery provider.
+ */
+function catalogLooksProviderless(snapshot) {
+  const rows = snapshot && Array.isArray(snapshot.skills) ? snapshot.skills : []
+  if (rows.length === 0) return false
+  return !rows.some((s) => s && typeof s.provider === 'string' && s.provider !== RUNTIME_PROVIDER_NAME)
+}
+
+/**
+ * Whether a read's provider proof means the catalog may be trusted.
+ *
+ * `'active'` is positive structural proof. `'unprovable'` is NOT proof and is
+ * accepted only because the alternative is refusing every skill write on a host
+ * that exposes no preset registry; the caller records that it degraded.
+ *
+ * @param {string} proof A verdict from `providerProofOf`.
+ * @returns {boolean} true when the read may be trusted on structural grounds.
+ */
+function providerProofIsPositive(proof) {
+  return proof === 'active'
+}
+
+async function readCatalogFor({ sessionAgent, reviewAgent, ctx }, { cwd, signal } = {}) {
+  // The scope that is read decides which layers are merged, and only an agent
+  // that JOINED a preset carries the preset's rows in its chain. The triggering
+  // session's agent is the one the host composed (dsh-api-session-controller
+  // calls `presets.mount(agentCtx, resolvedId)` during setup), so it is the
+  // first choice; the review agent is the fallback, and it is exactly the case
+  // that fails on this host, because `meta.agentPreset` records an identity but
+  // performs no mount.
+  const sources = [
+    [sessionAgent, 'session-agent'],
+    [reviewAgent, 'review-agent'],
+  ]
+  for (const [candidate, scope] of sources) {
+    const service = skillsServiceOf(candidate)
+    if (service === undefined || typeof service.snapshot !== 'function') continue
+    const snapshot = await service.snapshot({ cwd, signal, scope: candidate })
+    const providerProof = await providerProofOf(ctx, candidate)
+    return { ...snapshot, via: 'agent-ctx', scope, providerProof }
   }
   const snapshot = await ctx.skills.snapshot({ cwd, signal })
-  return { ...snapshot, via: 'plugin-ctx' }
+  return { ...snapshot, via: 'plugin-ctx', scope: undefined, providerProof: 'no-preset' }
 }
 
 /** Render final SKILL.md content: frontmatter (name/description) + body. */
@@ -1108,7 +1287,8 @@ module.exports = {
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
     // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
-    readCatalogFor,
+    readCatalogFor, catalogLooksProviderless, skillsServiceOf, providerProofOf, providerProofIsPositive,
+    RUNTIME_PROVIDER_NAME, REQUIRED_SKILL_PROVIDER,
     LANGUAGE_RETRIES, createLanguageResolver, countLabel,
     REVIEW_PROMPT_TEXT, REVIEW_LANGUAGE_DIRECTIVE,
     MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
@@ -1509,11 +1689,12 @@ module.exports = {
 
         // 2. zero-tool review agent（进程内、独立会话、不污染会话库）
         //
-        // 先建 agent 再读目录：目录必须走 agent 自己的 ctx（理由见
-        // readCatalogFor）。宿主是 setup(prepared.agent.ctx, prepared.agent)，
-        // 再把同一个 agent 交回来，所以 agent.ctx 就是 setup 收到的那个上下文，
-        // 不必在 setup 里另存一份服务。
+        // 目录读取的 scope 选择见 readCatalogFor：优先用「触发本次复盘的会话」
+        // 自己的 agent，因为宿主为它挂过 preset；复盘 agent 只是回退。
         const selection = ctx.agentDefaultModel.currentSelection()
+        // 触发会话的 agent 此刻仍然 live（turn/end 由该 agent 自己的事件流驱动），
+        // 它的 ctx 就是宿主 composeAgent 时 mount 过 preset 的那个 scope。
+        const sessionAgent = typeof ctx.agents.get === 'function' ? ctx.agents.get(sessionId) : undefined
         handle = await ctx.agents.create({
           sessionId: 'hermes-loop-review-' + randomUUID(),
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
@@ -1525,7 +1706,10 @@ module.exports = {
         trace('review-agent-created', { reviewSession: agent.id })
 
         // 3. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
-        const snapshot = await readCatalogFor(agent, ctx, { cwd, signal: controller.signal })
+        const snapshot = await readCatalogFor(
+          { sessionAgent, reviewAgent: agent, ctx },
+          { cwd, signal: controller.signal },
+        )
         const catalog = (snapshot.skills || [])
           .filter((s) => s.invocation === undefined || s.invocation.modelInvocable !== false)
           .map((s) => ({
@@ -1537,22 +1721,39 @@ module.exports = {
           ? catalog.map((s) => `- ${s.name}: ${s.description}`).join('\n')
           : REVIEW_INPUT_TEXT[lang].emptyCatalog
         const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
-        // The catalog can be short in two independent ways, and each needs its own
-        // flag because neither implies the other:
-        //  - `complete: false` — a provider threw or returned a partial
-        //    observation (dsh-skill sets cacheable=false on either).
+        // The catalog can be short in these independent ways. Each gets its own arm,
+        // and the trace records which fired:
+        //  - `complete: false` — a provider threw or returned a partial observation
+        //    (dsh-skill sets cacheable=false on either).
         //  - `via: 'plugin-ctx'` — no agent-scoped service existed, so this is the
-        //    sibling-only registry. It still reports `complete: true`, because
-        //    every provider it asked answered in full.
-        // Either way the catalog may be missing the skill this review should patch
-        // or create, so a skill conclusion drawn from it is not trustworthy.
-        const catalogShorted = snapshot.complete === false || snapshot.via === 'plugin-ctx'
+        //    sibling-only registry. It reports `complete: true`, because every
+        //    provider it asked answered in full.
+        //  - rows came back but every one is a runtime registration — the shipped
+        //    defect. The scope had no discovery provider, the read was still
+        //    genuinely scoped, and it still reported `complete: true`.
+        //
+        // The structural proof is consulted as a POSITIVE only. `'active'` means the
+        // agent's preset carries an enabled, ACTIVE skill provider, so a discovery
+        // provider IS in scope and even an empty catalog is trustworthy. Any other
+        // verdict is NOT read as absence: the global layer is always merged, so an
+        // agent that joined no preset may still see a global-plane provider
+        // (`dsh-base/cordis.patch.yml:297` defines one, which the web bundle disables
+        // in favour of presets). Treating `'no-preset'` as absence would withhold a
+        // valid catalog on such a host.
+        const providerProof = snapshot.providerProof
+        const catalogProviderless = catalogLooksProviderless(snapshot)
+        const catalogShorted = snapshot.complete === false
+          || snapshot.via === 'plugin-ctx'
+          || (!providerProofIsPositive(providerProof) && catalogProviderless)
         trace('review-inputs', {
           sessionId,
           messages: messages.length,
           catalogSize: catalog.length,
           catalogVia: snapshot.via,
+          catalogScope: snapshot.scope,
+          catalogProviderProof: providerProof,
           catalogComplete: snapshot.complete !== false,
+          catalogProviderless,
           catalogShorted,
           suspects: suspects.map((s) => s.name),
         })
@@ -1675,7 +1876,10 @@ module.exports = {
         // withheld either way. The memory channel does not read the skill catalog
         // and is unaffected, so it still runs.
         if (catalogShorted && conclusion.action !== 'nothing') {
-          ctx.logger.warn(`hermes-loop: review of session ${sessionId} returned ${conclusion.action} '${conclusion.skill}' but the skill catalog was short (via=${snapshot.via}, complete=${snapshot.complete !== false}, rows=${catalog.length}); skill conclusion withheld`)
+          // The three arms are reported separately: in the providerless case
+          // `via` and `complete` both read healthy, so a message naming only
+          // those two would describe a healthy read while withholding on it.
+          ctx.logger.warn(`hermes-loop: review of session ${sessionId} returned ${conclusion.action} '${conclusion.skill}' but the skill catalog was short (scope=${snapshot.scope}, via=${snapshot.via}, proof=${providerProof}, complete=${snapshot.complete !== false}, providerless=${catalogProviderless}, rows=${catalog.length}); skill conclusion withheld`)
           if (!hasMemoryAction) return
           conclusion.action = 'nothing'
           delete conclusion.skill
@@ -1883,8 +2087,27 @@ module.exports = {
 
     ctx.effect(() => {
       const dispose = ctx.on('session/event', onSessionEvent)
+      // A queued review is a closure over a session whose agent may be disposed
+      // before the queue drains. Dropping it here is cheaper than running it: the
+      // catalog read would fall back to the review agent, whose scope joined no
+      // preset, so the structural proof would report `no-preset` and withhold the
+      // skill conclusion anyway. The read is not unsafe either way, because
+      // `readCatalogFor` re-derives the scope and the proof at run time; this only
+      // avoids a review that cannot conclude anything about skills.
+      //
+      // Payload shape is `{ agent }`, not the agent itself
+      // (dsh-agent/lib/index.js:546-550 emits `[carrier, "agent/disposed", { agent }]`),
+      // and `agent.id` equals the session id (asserted at dsh-agent/lib/index.js:512).
+      const dropQueued = (payload) => {
+        const id = payload && payload.agent && payload.agent.id
+        if (typeof id !== 'string') return
+        const dropped = queued.delete(id)
+        if (dropped) ctx.logger.info(`hermes-loop: dropped queued review for session ${id} (agent disposed before the queue drained)`)
+      }
+      const disposeAgent = typeof ctx.on === 'function' ? ctx.on('agent/disposed', dropQueued) : undefined
       return () => {
         try { dispose() } catch {}
+        try { if (disposeAgent !== undefined) disposeAgent() } catch {}
         queued.clear()
         windows.clear()
         if (usageFlushTimer !== null) { clearTimeout(usageFlushTimer); usageFlushTimer = null }

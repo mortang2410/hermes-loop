@@ -155,7 +155,7 @@ test('applyConclusion: patch passes CAS when unchanged, fails when file drifted'
 
 // ── end-to-end through apply(): fake services drive a full review ───────
 
-function fakeServices(conclusionText, { agentSkills } = {}) {
+function fakeServices(conclusionText, { agentSkills, sessionAgent, sessionAgentSkills, presets } = {}) {
   const created = []
   const agent = {
     session: {
@@ -183,28 +183,89 @@ function fakeServices(conclusionText, { agentSkills } = {}) {
     tools: { restrict() {} },
   }
   agent.ctx = agentCtx
+  // The triggering session's own agent, as `ctx.agents.get(sessionId)` resolves it.
+  // In the host this agent is the one `composeAgent` mounted a preset onto, so its
+  // scoped read carries the preset's provider rows; the review agent created below
+  // does not. Tests that are not about that distinction leave this unset, which is
+  // the "session agent not live" shape the plugin must tolerate.
+  const liveSessionAgent = sessionAgent === undefined ? undefined : {
+    ...sessionAgent,
+    ctx: { get: (name) => (name === 'skills' ? sessionAgentSkills : undefined) },
+  }
   return {
     created,
     agent,
     agentCtx,
+    sessionAgent: liveSessionAgent,
+    // The host plane exposes the preset registry as `agentPresets`. The plugin
+    // reaches it with `ctx.get('agentPresets', false)`, so a test that does not
+    // supply one models a host without that service, which is the `unprovable`
+    // path the row-label fallback exists for.
+    //
+    // `composedPreset` is bound to the SESSION agent's context, as the host is:
+    // the review agent is created by this plugin and never mounts a preset, so a
+    // proof lookup against it must answer `undefined`. A fake that answered for
+    // every context would model a state the host cannot produce and would hide
+    // exactly the defect under test.
+    presets: presets === undefined ? undefined : buildPresets(presets, liveSessionAgent),
     agents: {
       create: async (opts) => {
         created.push(opts)
         if (typeof opts.setup === 'function') await opts.setup(agentCtx, agent)
         return { agent, dispose: async () => {} }
       },
+      get: (id) => (liveSessionAgent !== undefined && sessionAgent && sessionAgent.id === id ? liveSessionAgent : undefined),
     },
     agentDefaultModel: { currentSelection: () => ({ provider: 'prov', model: 'mdl' }) },
   }
 }
 
+/**
+ * A preset registry as the host exposes it, modelling structural provider proof.
+ * `presetId` is the preset the SESSION agent joined; `rows` is that preset's
+ * composition inventory. Both default to the healthy shape: the session agent
+ * joined `standard` and its skill provider row is enabled and ACTIVE.
+ *
+ * `presetId: null` models "the session agent joined no preset". A destructuring
+ * default replaces an explicit `undefined` argument, so `undefined` cannot
+ * express that case in the options object.
+ */
+function buildPresets({ presetId = 'standard', rows = [{ entryId: 'skill-filesystem', moduleName: REQUIRED_PROVIDER, enabled: true, fiberState: 2 }] } = {}, liveSessionAgent) {
+  const joined = presetId === null ? undefined : presetId
+  const preset = { id: joined === undefined ? 'standard' : joined, isDefault: false, rows }
+  return {
+    composedPreset: (agentCtx) => (liveSessionAgent !== undefined && agentCtx === liveSessionAgent.ctx ? joined : undefined),
+    compositionInventory: async () => [preset],
+  }
+}
+
+const REQUIRED_PROVIDER = '@deepseek-ai/dsh-skill-filesystem'
+
 // A skills service as the review agent's own ctx exposes it. Tests that are not
 // about the catalog give the agent one of these, so the short-catalog guard does
 // not withhold the skill conclusion they are actually exercising.
-const catalogService = (skills, complete = true) => ({ snapshot: async () => ({ skills, complete }) })
+//
+// Rows carry `provider` because `dsh-skill` stamps one on EVERY row it returns:
+// `register()` sets `provider: skill.provider ?? 'runtime'` for runtime skills,
+// and each provider stamps its own name on the rows it discovers (the filesystem
+// provider uses `filesystem`). A row without a provider is therefore not a shape
+// the host can produce, and the guard reads that field to tell a catalog that a
+// real provider answered from one that only merged runtime registrations.
+const catalogService = (skills, complete = true) => ({
+  // `map(provided)` would pass the array INDEX as the second argument, silently
+  // stamping `provider: 0`. Call it through an arrow so the default applies.
+  snapshot: async () => ({ skills: skills.map((row) => provided(row)), complete }),
+})
+
+/**
+ * Stamp the provider name a real registry would have put on this row. The row's
+ * own `provider` wins when it carries one, so a fixture can model a runtime row.
+ */
+const provided = (row, provider = 'filesystem') => ({ ...row, provider: row.provider ?? provider })
 
 function setupPlugin(config, services) {
   const handlers = []
+  const named = new Map()
   const cleanups = []
   const infos = []
   const warns = []
@@ -213,11 +274,16 @@ function setupPlugin(config, services) {
     logger: { info: (m) => infos.push(String(m)), warn: (m) => warns.push(String(m)) },
     // 信任栅栏：默认放行（undefined）；用例可用 services.connection 覆盖为 401/403
     connection: { requestRejection: () => undefined },
-    on: (name, fn) => { handlers.push(fn); return () => {} },
+    on: (name, fn) => { handlers.push(fn); if (!named.has(name)) named.set(name, []); named.get(name).push(fn); return () => {} },
     effect: (fn) => { cleanups.push(fn()) },
-    skills: { snapshot: async () => ({ skills: [{ name: 'known-skill', description: 'a known skill about deploys', invocation: { modelInvocable: true } }], complete: true }) },
+    skills: { snapshot: async () => ({ skills: [{ name: 'known-skill', description: 'a known skill about deploys', invocation: { modelInvocable: true }, provider: 'filesystem' }], complete: true }) },
     // 静态注入契约：服务直接挂在 ctx 上；settings 缺席时走 config+defaults 回退
     settings: undefined,
+    // `ctx.get(name, strict)` is how the plugin reaches a service that is NOT in
+    // its static inject list. `agentPresets` is read that way (strict=false, so a
+    // host without the registry yields undefined instead of throwing), which the
+    // plugin treats as "cannot prove either way" and degrades to row labels.
+    get: (name) => (name === 'agentPresets' ? services.presets : undefined),
     ...services,
   }
   // 宿主面动态注入 webServer（skills-management share-services 同款，已验证可用）
@@ -226,6 +292,11 @@ function setupPlugin(config, services) {
   plugin.apply(ctx, config)
   return {
     fire: (session, event) => { for (const h of handlers) h(session, event) },
+    // Deliver one host event to ONLY the listeners registered for that name, with
+    // the payload the host actually sends. `fire` cannot express this: it hands
+    // every event to every handler, so a named event would arrive at the
+    // session/event handlers too, carrying a payload they never see in production.
+    emit: (name, payload) => { for (const h of named.get(name) || []) h(payload) },
     infos, warns, cleanups, routes,
   }
 }
@@ -1024,7 +1095,7 @@ test('review fix: patch succeeds for skills with description longer than the cat
       action: 'patch', skill: 'long-desc-skill', body: 'patched body',
       baseHash: sha256(original), baseDescription: longDesc,
     })
-    const catalog = [{ name: 'long-desc-skill', description: longDesc.slice(0, 500), resourceBase: { kind: 'directory', path: skillDir }, invocation: { modelInvocable: true } }]
+    const catalog = [provided({ name: 'long-desc-skill', description: longDesc.slice(0, 500), resourceBase: { kind: 'directory', path: skillDir }, invocation: { modelInvocable: true } })]
     // snapshot 返回目录截断后的 description（复现真实环境），resourceBase 在全局库内
     const services = fakeServices('```json\n' + conclusion + '\n```', { agentSkills: catalogService(catalog) })
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
@@ -1779,5 +1850,385 @@ test('v0.5 追加：status 的 memory.items 带只读条目原文', async () => 
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
     await rm(home, { recursive: true, force: true })
+  }
+})
+
+// ── 审查修复（2026-10-07）：scope 必须挂过 preset，且空目录不等于健康 ──────
+
+test('review fix: the session agent is read before the review agent, because only it joined a preset', async () => {
+  // The defect this pins: reading through an agent context is necessary but NOT
+  // sufficient. `snapshot({ scope })` merges the global layer plus the scope
+  // CHAIN, and the host links an agent's scope to a preset generation only by
+  // calling `presets.mount(agentCtx, presetId)` inside `setup`
+  // (dsh-api-session-controller/lib/index.js:368). The triggering session's agent
+  // is the one the host composed; the review agent this plugin creates itself
+  // never mounts, so its chain holds no filesystem provider. On the live host
+  // that read is genuinely scoped, genuinely `complete: true`, and returns ONE
+  // runtime row.
+  //
+  // So the two agents must disagree here, and the assertions name the full set:
+  // an implementation that reads the review agent first fails on the prompt
+  // contents, not merely on a label.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-session-agent-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const sessionCatalog = Array.from({ length: 9 }, (_, i) => provided({
+      name: `session-skill-${i}`,
+      description: `skill ${i} about deploys`,
+      invocation: { modelInvocable: true },
+    }))
+    let sessionScopedOptions
+    const sessionAgentSkills = {
+      snapshot: async (opts) => { sessionScopedOptions = opts; return { skills: sessionCatalog, complete: true } },
+    }
+    // The review agent answers with exactly the live shape: one runtime row,
+    // complete, no discovery provider behind it.
+    const agentSkills = {
+      snapshot: async () => ({
+        skills: [{ name: 'vision-skills', description: 'a runtime registration', invocation: { modelInvocable: true }, provider: 'runtime' }],
+        complete: true,
+      }),
+    }
+    const services = fakeServices('```json\n{"action":"nothing","rationale":"r"}\n```', {
+      agentSkills,
+      sessionAgent: { id: 'session-priority', session: { seq: 0, events: [] } },
+      sessionAgentSkills,
+    })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+    const session = { id: 'session-priority', header: {}, deriveMessages: () => [{ role: 'user', content: 'we deployed' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+
+    const prompt = services.created.find((c) => c && c.content).content[0].text
+    assert.ok(prompt.includes('session-skill-8'), 'the session agent catalog must supply the prompt')
+    assert.ok(!prompt.includes('vision-skills'), 'the providerless review-agent read must not be the catalog')
+
+    // The scope passed must be that session agent, not the review agent: ScopeKey
+    // is identity-compared, so passing the wrong agent reads the wrong layers.
+    assert.ok(sessionScopedOptions, 'the session agent service must be called')
+    assert.equal(sessionScopedOptions.scope, services.sessionAgent, 'the snapshot must be scoped to the session agent')
+
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogSize, 9, 'the traced size must be the session agent row count')
+    assert.equal(inputs.catalogScope, 'session-agent', 'the trace must name which scope answered')
+    assert.equal(inputs.catalogShorted, false, 'a provider-backed catalog is not short')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: a non-empty catalog with no discovery provider withholds the skill conclusion', async () => {
+  // The arm that catches the shipped defect. Neither existing signal can see it:
+  // the read IS agent-scoped (`via` says so) and every provider it asked answered
+  // in full (`complete: true`). The only evidence left is that the rows came back
+  // stamped `runtime`, meaning no discovery provider was reachable from the scope
+  // that was read. A create drawn from such a catalog can duplicate a skill the
+  // partial view never listed, so the skill half must be withheld while memory,
+  // which does not read the catalog, still lands.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-providerless-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const conclusion = JSON.stringify({
+      action: 'create', skill: 'should-not-land', description: 'd', body: 'b',
+      memory: { action: 'add', store: 'memory', text: 'memory still runs' },
+    })
+    const services = fakeServices('```json\n' + conclusion + '\n```', {
+      agentSkills: {
+        snapshot: async () => ({
+          skills: [{ name: 'vision-skills', description: 'a runtime registration', invocation: { modelInvocable: true }, provider: 'runtime' }],
+          complete: true,
+        }),
+      },
+    })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-providerless', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'deploys' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+
+    await assert.rejects(
+      readFile(join(home, 'skills', 'should-not-land', 'SKILL.md'), 'utf8'),
+      'a create from a providerless catalog must not be written',
+    )
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogProviderless, true, 'the trace must name the providerless read')
+    assert.equal(inputs.catalogShorted, true, 'the trace must flag the catalog as short')
+    assert.equal(inputs.catalogVia, 'agent-ctx', 'the read was still agent-scoped, which is why via alone cannot catch it')
+    assert.equal(inputs.catalogComplete, true, 'and it still reported complete, which is why complete alone cannot catch it')
+    // Memory does not read the catalog, so the other channel still lands.
+    assert.ok(t.infos.some((m) => m.includes('memory')), t.infos.join('|'))
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: an empty catalog is not treated as providerless, so a first create still lands', async () => {
+  // Emptiness cannot distinguish "this scope has no provider" from "this library
+  // genuinely holds no skills": `collectFresh` leaves `cacheable` true in both and
+  // the snapshot API exposes nothing else. Flagging it would make the first create
+  // on a fresh install impossible, and with no rows there is no suspect to inject,
+  // so no valid baseHash can exist and a patch cannot be produced either. The
+  // plugin-scope arm still covers the empty read that IS knowably providerless.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-empty-catalog-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const conclusion = JSON.stringify({ action: 'create', skill: 'first-skill', description: 'd', body: 'b' })
+    const services = fakeServices('```json\n' + conclusion + '\n```', { agentSkills: catalogService([]) })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-empty', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'first' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.match(await readFile(join(home, 'skills', 'first-skill', 'SKILL.md'), 'utf8'), /b/, 'an empty agent-scoped catalog must not block a create')
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8'))
+      .trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogProviderless, false, 'an empty catalog is not evidence of a missing provider')
+    assert.equal(inputs.catalogShorted, false, 'so it must not be flagged short')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+// ── 审查修复（2026-10-07 r3）：结构证据只证「有」，不证「无」 ──────────────
+
+test('review fix: an ACTIVE provider proof makes a suspicious catalog trustworthy, and a named proof cannot short it', async () => {
+  // The structural proof is consulted as a POSITIVE only, and this is why.
+  //
+  // A catalog whose rows are all runtime is the shipped defect WHEN no discovery
+  // provider is in scope. But `no-preset` does NOT prove there is no provider: the
+  // global layer is always merged (`dsh-skill/lib/index.js:299`), and a host may
+  // put the filesystem provider there (`dsh-base/cordis.patch.yml:297` defines such
+  // a row; the web bundle disables it in favour of presets). So the proof is used
+  // to trust an otherwise-suspicious read, never to condemn one on its own.
+  //
+  // Case A: runtime-only rows, but the proof is `'active'`: a provider IS in scope,
+  // so the create is allowed. This is the case row labels alone would withhold.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-proof-active-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const conclusion = JSON.stringify({ action: 'create', skill: 'lands-ok', description: 'd', body: 'b' })
+    const services = fakeServices('```json\n' + conclusion + '\n```', {
+      sessionAgent: { id: 'session-proof-active', session: { seq: 0, events: [] } },
+      // A provider is in scope, but it happened to return only this runtime row.
+      sessionAgentSkills: catalogService([{ name: 'vision-skills', description: 'd', invocation: { modelInvocable: true }, provider: 'runtime' }]),
+      agentSkills: catalogService([{ name: 'vision-skills', description: 'd', invocation: { modelInvocable: true }, provider: 'runtime' }]),
+      presets: {},
+    })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-proof-active', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'x' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.match(await readFile(join(home, 'skills', 'lands-ok', 'SKILL.md'), 'utf8'), /b/, 'an ACTIVE proof must permit the create')
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogProviderProof, 'active', 'the trace must record positive structural proof')
+    assert.equal(inputs.catalogProviderless, true, 'the rows are runtime-only, so the row-label arm also fired')
+    assert.equal(inputs.catalogShorted, false, 'but the ACTIVE proof overrides it: a provider is in scope')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: a runtime-only catalog is withheld whenever no active provider proof exists', async () => {
+  // The shipped defect, across every non-positive proof verdict. Each of these is
+  // a host shape where nothing established that a discovery provider answered the
+  // scope, while the rows in hand are all runtime registrations. The skill half
+  // must be withheld and memory, which does not read the catalog, must still run.
+  for (const [label, presets, expected] of [
+    // No preset registry at all: `unprovable`. The live host's own shape today.
+    ['unprovable', undefined, 'unprovable'],
+    // The agent joined no preset. NOT proof of absence, but combined with
+    // runtime-only rows it leaves no evidence a provider answered.
+    ['no-preset', { presetId: null }, 'no-preset'],
+    // The preset names no skill provider row.
+    ['provider-absent', { rows: [] }, 'provider-absent'],
+    // The row exists but is disabled, or enabled with no live fiber.
+    ['provider-disabled', { rows: [{ entryId: 'skill-filesystem', moduleName: REQUIRED_PROVIDER, enabled: false, fiberState: 2 }] }, 'provider-inactive'],
+    ['provider-loading', { rows: [{ entryId: 'skill-filesystem', moduleName: REQUIRED_PROVIDER, enabled: true, fiberState: 1 }] }, 'provider-inactive'],
+    ['provider-no-fiber', { rows: [{ entryId: 'skill-filesystem', moduleName: REQUIRED_PROVIDER, enabled: true }] }, 'provider-inactive'],
+  ]) {
+    const home = await mkdtemp(join(tmpdir(), 'hermes-loop-proof-' + label + '-'))
+    const oldHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    try {
+      const conclusion = JSON.stringify({
+        action: 'create', skill: 'must-not-land', description: 'd', body: 'b',
+        memory: { action: 'add', store: 'memory', text: 'memory still runs' },
+      })
+      const runtimeOnly = catalogService([{ name: 'vision-skills', description: 'd', invocation: { modelInvocable: true }, provider: 'runtime' }])
+      const services = fakeServices('```json\n' + conclusion + '\n```', {
+        sessionAgent: { id: 'session-proof-' + label, session: { seq: 0, events: [] } },
+        sessionAgentSkills: runtimeOnly,
+        agentSkills: runtimeOnly,
+        ...(presets === undefined ? {} : { presets }),
+      })
+      const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+      const session = { id: 'session-proof-' + label, header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'x' }] }
+      t.fire(session, completedTurn)
+      await new Promise((r) => setTimeout(r, 120))
+
+      await assert.rejects(readFile(join(home, 'skills', 'must-not-land', 'SKILL.md'), 'utf8'), label + ': a runtime-only catalog must be withheld')
+      const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+      const inputs = ledger.find((e) => e.event === 'review-inputs')
+      assert.equal(inputs.catalogProviderProof, expected, label + ': the trace must name the structural verdict')
+      assert.equal(inputs.catalogProviderless, true, label + ': the rows are runtime-only')
+      assert.equal(inputs.catalogShorted, true, label + ': so the catalog must be flagged short')
+      assert.ok(t.infos.some((m) => m.includes('memory')), label + ': memory does not read the catalog and must still run')
+    } finally {
+      if (oldHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = oldHome
+      await rm(home, { recursive: true, force: true })
+    }
+  }
+})
+
+test('review fix: a provider-backed catalog is allowed without any structural proof', async () => {
+  // The other half of the asymmetry. When a discovery provider DID answer, the
+  // rows say so and no composition reading is needed, so an ordinary host that
+  // exposes no preset registry still works. Without this, the structural arm would
+  // turn "cannot prove" into "refuse", breaking every host that lacks the registry.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-proof-fallback-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const conclusion = JSON.stringify({ action: 'create', skill: 'lands-via-rows', description: 'd', body: 'b' })
+    const services = fakeServices('```json\n' + conclusion + '\n```', {
+      sessionAgent: { id: 'session-proof-fallback', session: { seq: 0, events: [] } },
+      sessionAgentSkills: catalogService([{ name: 'real-skill', description: 'd', invocation: { modelInvocable: true } }]),
+      agentSkills: catalogService([{ name: 'real-skill', description: 'd', invocation: { modelInvocable: true } }]),
+      // no `presets`: the host exposes no agentPresets service.
+    })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-proof-fallback', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'x' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.match(await readFile(join(home, 'skills', 'lands-via-rows', 'SKILL.md'), 'utf8'), /b/, 'a provider-backed catalog must not need structural proof')
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogProviderProof, 'unprovable', 'the trace must record that proof was unavailable')
+    assert.equal(inputs.catalogProviderless, false, 'because a real provider row answered')
+    assert.equal(inputs.catalogShorted, false, 'so the catalog is healthy')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: an empty catalog is trusted even without a structural proof, so a first create still lands', async () => {
+  // A NAMED CEILING, pinned so it is not rediscovered as a bug later. An empty
+  // catalog is never flagged by the row-label arm, with or without a proof,
+  // because emptiness cannot distinguish a scope whose provider never answered
+  // from a library that genuinely holds no skills (`collectFresh` leaves
+  // `cacheable` true in both). Refusing there would make the first create on a
+  // fresh install impossible, and with no rows there is no suspect to inject, so
+  // no `baseHash` can exist and no patch could be produced either. The residual
+  // risk is a duplicate create when a provider really did fail to answer; the fix
+  // would have to come from a host API that enumerates the providers behind a
+  // scoped read, which does not exist.
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-empty-proven-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const conclusion = JSON.stringify({ action: 'create', skill: 'first-skill', description: 'd', body: 'b' })
+    const services = fakeServices('```json\n' + conclusion + '\n```', {
+      sessionAgent: { id: 'session-empty-proven', session: { seq: 0, events: [] } },
+      sessionAgentSkills: catalogService([]),
+      agentSkills: catalogService([]),
+      presets: {},
+    })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-empty-proven', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'x' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.match(await readFile(join(home, 'skills', 'first-skill', 'SKILL.md'), 'utf8'), /b/, 'an empty catalog must allow the first create')
+    const ledger = (await readFile(join(home, 'hermes-loop', 'activity.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+    const inputs = ledger.find((e) => e.event === 'review-inputs')
+    assert.equal(inputs.catalogProviderProof, 'active', 'the trace records the proof when one is available')
+    assert.equal(inputs.catalogProviderless, false, 'an empty catalog is never flagged by the row-label arm')
+    assert.equal(inputs.catalogShorted, false, 'so the create is allowed')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('providerProofOf never rejects: every malformed host shape degrades to a verdict', async () => {
+  // A proof that aborts the review is worse than one that admits it could not
+  // tell, because the review then reports an error and drops BOTH channels. Each
+  // host-shaped failure below must resolve to a verdict string.
+  const { providerProofOf, REQUIRED_SKILL_PROVIDER: req } = plugin.__internals
+  const agent = { ctx: { marker: true } }
+  const throwingRow = Object.defineProperty({}, 'moduleName', { get() { throw new Error('bad row') } })
+  const cases = [
+    ['ctx.get throws', { get() { throw new Error('no get') } }, 'unprovable'],
+    ['no registry', { get: () => undefined }, 'unprovable'],
+    ['registry lacks api', { get: () => ({}) }, 'unprovable'],
+    ['composedPreset throws', { get: () => ({ composedPreset() { throw new Error('x') }, compositionInventory: async () => [] }) }, 'unprovable'],
+    ['inventory rejects', { get: () => ({ composedPreset: () => 'standard', compositionInventory: async () => { throw new Error('x') } }) }, 'unprovable'],
+    ['inventory not an array', { get: () => ({ composedPreset: () => 'standard', compositionInventory: async () => ({}) }) }, 'unprovable'],
+    ['preset not found', { get: () => ({ composedPreset: () => 'gone', compositionInventory: async () => [] }) }, 'unprovable'],
+    ['rows not an array', { get: () => ({ composedPreset: () => 'standard', compositionInventory: async () => [{ id: 'standard', rows: {} }] }) }, 'unprovable'],
+    ['row accessor throws', { get: () => ({ composedPreset: () => 'standard', compositionInventory: async () => [{ id: 'standard', rows: [throwingRow] }] }) }, 'malformed'],
+  ]
+  for (const [label, ctx, expected] of cases) {
+    const verdict = await providerProofOf(ctx, agent)
+    assert.equal(verdict, expected, label + ': must degrade, not reject')
+  }
+})
+
+test('known ceiling: a provider that answers zero rows is indistinguishable from no provider, so it is withheld', async () => {
+  // Pinned so it is not rediscovered as a bug. Two situations are byte-identical
+  // through every public API:
+  //   (a) no discovery provider was reachable (the shipped defect), and
+  //   (b) a provider WAS reachable and the library is empty, while a runtime
+  //       registration makes the snapshot nonempty.
+  // `snapshot()` returns only `{ skills, complete }`
+  // (`dsh-skill/lib/types/index.d.ts:152-157`); a provider answering zero rows
+  // contributes zero rows, so nothing records that it participated, and no API
+  // enumerates the providers behind a scoped read.
+  //
+  // Withholding is the deliberate direction: a missed first create is recoverable,
+  // a duplicate create from a catalog that never listed the matching skill is not.
+  // The cost is bounded and self-healing, which the last case shows.
+  const { catalogLooksProviderless } = plugin.__internals
+  const runtimeRow = { name: 'vision-skills', description: 'd', invocation: { modelInvocable: true }, provider: 'runtime' }
+
+  // (a) and (b) are the same observation.
+  assert.equal(catalogLooksProviderless({ skills: [runtimeRow], complete: true }), true, 'runtime rows alone are withheld')
+
+  // A genuinely empty catalog is NOT flagged, so a fresh install is not blocked
+  // when a provider is proven active (see the empty-catalog test above).
+  assert.equal(catalogLooksProviderless({ skills: [], complete: true }), false, 'emptiness alone is not evidence')
+
+  // Self-healing: one provider-backed row ends the ambiguity for good.
+  assert.equal(
+    catalogLooksProviderless({ skills: [runtimeRow, { name: 'real', description: 'd', provider: 'filesystem' }], complete: true }),
+    false,
+    'a single provider-backed row ends the withholding',
+  )
+
+  // The structural proof is the only thing that can rescue case (b): when a
+  // provider is proven active, the read is trusted even with runtime-only rows.
+  const { providerProofIsPositive } = plugin.__internals
+  assert.equal(providerProofIsPositive('active'), true, 'an active proof is positive evidence')
+  for (const verdict of ['no-preset', 'provider-absent', 'provider-inactive', 'malformed', 'unprovable']) {
+    assert.equal(providerProofIsPositive(verdict), false, verdict + ' is not positive evidence')
   }
 })
