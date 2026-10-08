@@ -1,7 +1,7 @@
 /* dsh-plugin-hermes-loop — browser half (hand-rolled loader bundle, no build step).
  *
  * One tab in the conversation view ring ("Hermes Loop"), next to 对话/轨迹/上下文.
- * Data comes exclusively from the host half's /hermes-loop/api/* routes — the
+ * Data comes exclusively from the host half's /api/hermes-loop/* routes, the
  * client holds no loop state of its own. Function components only (class
  * components silently never render in the plugin loader) and no createRoot
  * (render through the slot tree). Colors ride the --dsw-* theme tokens.
@@ -264,7 +264,7 @@ window.__ModuleLoader__.load({
         React.useEffect(function () {
           var alive = true
           var load = function () {
-            fetch('/hermes-loop/api/status?sessionId=' + encodeURIComponent(sessionId || ''))
+            fetch('/api/hermes-loop/status?sessionId=' + encodeURIComponent(sessionId || ''))
               .then(function (r) { return r.json() })
               .then(function (d) { if (alive) { setData(d); setError(null) } })
               .catch(function (e) { if (alive) setError(String(e && e.message || e)) })
@@ -279,7 +279,7 @@ window.__ModuleLoader__.load({
         var flashErr = _fe[0]
         var setFlashErr = _fe[1]
         var savePatch = function (patch) {
-          fetch('/hermes-loop/api/settings', {
+          fetch('/api/hermes-loop/settings', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ patch: patch }),
@@ -293,7 +293,7 @@ window.__ModuleLoader__.load({
         var manualFlash = manualState[0]
         var setManualFlash = manualState[1]
         var reviewNow = function () {
-          fetch('/hermes-loop/api/review-now', {
+          fetch('/api/hermes-loop/review-now', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ sessionId: sessionId || '' }),
@@ -312,7 +312,7 @@ window.__ModuleLoader__.load({
         var setCuratorFlash = _cur[1]
         var flashCurator = function (text) { setCuratorFlash(text); setTimeout(function () { setCuratorFlash(null) }, 3500) }
         var curatorRun = function () {
-          fetch('/hermes-loop/api/curator/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+          fetch('/api/hermes-loop/curator/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
             .then(function (r) { return r.json() })
             .then(function (d) {
               var rep = d && d.report || {}
@@ -322,7 +322,7 @@ window.__ModuleLoader__.load({
             .catch(function () {})
         }
         var restoreSkill = function (name) {
-          fetch('/hermes-loop/api/curator/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name }) })
+          fetch('/api/hermes-loop/curator/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name }) })
             .then(function (r) { return r.json() })
             .then(function (d) { flashCurator(d && d.ok ? t('curator.restored') + ': ' + name : (d && d.error || '')); setNonce(function (n) { return n + 1 }) })
             .catch(function () {})

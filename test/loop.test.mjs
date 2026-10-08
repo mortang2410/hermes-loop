@@ -413,13 +413,30 @@ test('every route sits behind the connection trust fence', async () => {
   const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
   await new Promise((r) => setTimeout(r, 30))
   assert.equal(t.routes.length, 1)
-  const req = { method: 'GET', url: '/hermes-loop/api/status', headers: {} }
+  const req = { method: 'GET', url: '/api/hermes-loop/status', headers: {} }
   const res = fakeRes()
   t.routes[0].handler(req, res)
   assert.equal(res.statusCode, 401, 'unauthenticated status read is refused')
 })
 
-test('GET /hermes-loop/api/status exposes settings, per-session counters and written skills', async () => {
+// The remote-access boot script rewrites only URLs under /api/ (plus sidebar,
+// git and pet) for paired devices. A route or browser call outside /api/ never
+// reaches the host from a Tailscale or LAN device, so pin both ends to /api/.
+test('host route and every browser call sit under the remote-rewritten /api/ prefix', async () => {
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(t.routes.length, 1)
+  assert.equal(t.routes[0].path, '/api/hermes-loop', 'host route must live under /api/')
+  const bundle = await readFile(new URL('../client/bundle.js', import.meta.url), 'utf8')
+  const fetched = [...bundle.matchAll(/fetch\('(\/[^']*)'/g)].map((m) => m[1])
+  assert.ok(fetched.length >= 5, `expected the five browser calls, found ${fetched.length}`)
+  for (const url of fetched) {
+    assert.ok(url.startsWith('/api/hermes-loop/'), `browser call outside the remote-rewritten prefix: ${url}`)
+  }
+})
+
+test('GET /api/hermes-loop/status exposes settings, per-session counters and written skills', async () => {
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-api-'))
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
@@ -429,12 +446,12 @@ test('GET /hermes-loop/api/status exposes settings, per-session counters and wri
     await new Promise((r) => setTimeout(r, 30))
     assert.equal(t.routes.length, 1)
     const route = t.routes[0]
-    assert.equal(route.path, '/hermes-loop/api')
+    assert.equal(route.path, '/api/hermes-loop')
     const session = { id: 'session-api', header: {}, deriveMessages: () => [] }
     t.fire(session, completedTurn)
     await new Promise((r) => setTimeout(r, 80))
     const res = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-api' }, res)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=session-api' }, res)
     const body = JSON.parse(res.body)
     assert.equal(res.statusCode, 200)
     assert.equal(body.settings.mode, 'log-only')
@@ -443,7 +460,7 @@ test('GET /hermes-loop/api/status exposes settings, per-session counters and wri
     assert.ok(Array.isArray(body.activity) && body.activity.length > 0)
     assert.ok(Array.isArray(body.written))
     const notFound = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/nope' }, notFound)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/nope' }, notFound)
     assert.equal(notFound.statusCode, 404)
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
@@ -473,7 +490,7 @@ test('GET /status never blocks on a slow skills.snapshot (panel opens instantly)
     // 首次请求：快照永不到达也不得阻塞（本机冷重扫实测 ~3.7s，这里用永不 settle 的 promise 顶格验证）
     const started = Date.now()
     const res = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-slow' }, res)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=session-slow' }, res)
     const elapsed = Date.now() - started
     assert.equal(res.statusCode, 200)
     assert.ok(elapsed < 500, `status must not await skills.snapshot (took ${elapsed}ms)`)
@@ -484,7 +501,7 @@ test('GET /status never blocks on a slow skills.snapshot (panel opens instantly)
     fulfilSnapshot({ skills: [{ name: 'slow-skill', invocation: { modelInvocable: false } }] })
     await new Promise((r) => setTimeout(r, 30))
     const res2 = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-slow' }, res2)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=session-slow' }, res2)
     const row2 = JSON.parse(res2.body).usage.rows.find((r) => r.skill === 'slow-skill')
     assert.equal(row2.modelInvocable, false)
   } finally {
@@ -513,7 +530,7 @@ function makeSettingsService({ failUpdate, initial } = {}) {
   }
 }
 
-test('POST /hermes-loop/api/settings persists the patch via ctx.settings.update (0.1.7)', async () => {
+test('POST /api/hermes-loop/settings persists the patch via ctx.settings.update (0.1.7)', async () => {
   const services = fakeServices('```json\n{"action":"nothing"}\n```')
   const settings = makeSettingsService()
   const t = setupPlugin({ turnInterval: 5 }, { ...services, settings })
@@ -533,7 +550,7 @@ test('GET /status reflects live settings from the settings document (0.1.7 descr
   const t = setupPlugin({}, { ...services, settings })
   await new Promise((r) => setTimeout(r, 20))
   const res = fakeRes()
-  await t.routes[0].handler(makeGet('/hermes-loop/api/status'), res)
+  await t.routes[0].handler(makeGet('/api/hermes-loop/status'), res)
   const body = JSON.parse(res.body)
   assert.equal(res.statusCode, 200)
   assert.equal(body.settings.mode, 'log-only', 'values from the settings document win over base config')
@@ -566,7 +583,7 @@ function reqBody(obj) {
   const data = JSON.stringify(obj)
   const req = new (require('node:events').EventEmitter)()
   req.method = 'POST'
-  req.url = '/hermes-loop/api/settings'
+  req.url = '/api/hermes-loop/settings'
   process.nextTick(() => { req.emit('data', Buffer.from(data)); req.emit('end') })
   return req
 }
@@ -664,7 +681,7 @@ test('POST review-now starts a review for a live session, bypassing thresholds',
   const post = (body) => new Promise((fulfil) => {
     const res = { statusCode: null, body: null, writeHead(s) { this.statusCode = s }, end(b) { this.body = b } }
     const req = new (require('node:events').EventEmitter)()
-    req.method = 'POST'; req.url = '/hermes-loop/api/review-now'
+    req.method = 'POST'; req.url = '/api/hermes-loop/review-now'
     process.nextTick(() => { req.emit('data', Buffer.from(JSON.stringify(body))); req.emit('end') })
     route.handler(req, res).then(() => fulfil({ status: res.statusCode, body: JSON.parse(res.body) }))
   })
@@ -715,7 +732,7 @@ test('usage stats: skill tool/call counts, catalog exposure, persisted and expos
     // 防抖冲洗
     await new Promise((r) => setTimeout(r, 5600))
     const res = { statusCode: null, body: null, writeHead(s) { this.statusCode = s }, end(b) { this.body = b } }
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-usage' }, res)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=session-usage' }, res)
     const body = JSON.parse(res.body)
     if (body.usage.totalCalls !== 3) console.log('DEBUG usage:', JSON.stringify(body.usage), 'warns:', t.warns, 'routes:', t.routes.length)
     assert.equal(body.usage.totalCalls, 3)
@@ -746,7 +763,7 @@ test('usage stats survive a restart (loaded from usage.json)', async () => {
     const t = setupPlugin({ turnInterval: 999, mode: 'log-only' }, services)
     await new Promise((r) => setTimeout(r, 30))
     const res = { statusCode: null, body: null, writeHead(s) { this.statusCode = s }, end(b) { this.body = b } }
-    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, res)
+    await t.routes[0].handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=' }, res)
     const row = JSON.parse(res.body).usage.rows.find((r) => r.skill === 'old-skill')
     assert.equal(row.count, 7)
   } finally {
@@ -876,7 +893,7 @@ test('curator: manual pass archives an aged managed skill (flag flip), restore r
 
     // 巡检：old → archived（文件翻键），mid → stale（文件不动）
     const runRes = fakeRes()
-    await route.handler(postJson('/hermes-loop/api/curator/run', {}), runRes)
+    await route.handler(postJson('/api/hermes-loop/curator/run', {}), runRes)
     assert.equal(runRes.statusCode, 200)
     const report = JSON.parse(runRes.body).report
     assert.deepEqual(report.transitions.map((x) => [x.skill, x.to]).sort(),
@@ -886,7 +903,7 @@ test('curator: manual pass archives an aged managed skill (flag flip), restore r
 
     // status 快照透出状态与计数
     const statusRes = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, statusRes)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=' }, statusRes)
     const curator = JSON.parse(statusRes.body).curator
     assert.equal(curator.counts.archived, 1)
     assert.equal(curator.counts.stale, 1)
@@ -894,22 +911,22 @@ test('curator: manual pass archives an aged managed skill (flag flip), restore r
 
     // 恢复：移除治理键 + 状态回 active + lastRestoredAt 顶住再归档
     const restoreRes = fakeRes()
-    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'old-skill' }), restoreRes)
+    await route.handler(postJson('/api/hermes-loop/curator/restore', { name: 'old-skill' }), restoreRes)
     assert.equal(restoreRes.statusCode, 200)
     assert.doesNotMatch(await readFile(join(home, 'skills', 'old-skill', 'SKILL.md'), 'utf8'), /disable-model-invocation/)
     const rerunRes = fakeRes()
-    await route.handler(postJson('/hermes-loop/api/curator/run', {}), rerunRes)
+    await route.handler(postJson('/api/hermes-loop/curator/run', {}), rerunRes)
     assert.equal(JSON.parse(rerunRes.body).report.transitions.length, 0, 'restored skill must not re-archive next pass')
 
     // 错误路径：非纳管 404，非归档 400，坏名字 400
     const unknown = fakeRes()
-    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'ghost' }), unknown)
+    await route.handler(postJson('/api/hermes-loop/curator/restore', { name: 'ghost' }), unknown)
     assert.equal(unknown.statusCode, 404)
     const notArchived = fakeRes()
-    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'old-skill' }), notArchived)
+    await route.handler(postJson('/api/hermes-loop/curator/restore', { name: 'old-skill' }), notArchived)
     assert.equal(notArchived.statusCode, 400)
     const badName = fakeRes()
-    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'Bad Name' }), badName)
+    await route.handler(postJson('/api/hermes-loop/curator/restore', { name: 'Bad Name' }), badName)
     assert.equal(badName.statusCode, 400)
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
@@ -936,7 +953,7 @@ test('curator: pre-existing plugin-created skills are backfilled from the audit 
     const t = setupPlugin({}, services)
     await new Promise((r) => setTimeout(r, 80)) // usageLoaded + backfill
     const res = fakeRes()
-    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, res)
+    await t.routes[0].handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=' }, res)
     const skills = JSON.parse(res.body).curator.skills
     const legacy = skills.find((r) => r.skill === 'legacy-1')
     assert.ok(legacy, 'audit-ledger created skill must be backfilled into the managed set')
@@ -960,7 +977,7 @@ test('curator: disabled setting skips the pass; created conclusions get register
     await new Promise((r) => setTimeout(r, 30))
     const route = t.routes[0]
     const runRes = fakeRes()
-    await route.handler(postJson('/hermes-loop/api/curator/run', {}), runRes)
+    await route.handler(postJson('/api/hermes-loop/curator/run', {}), runRes)
     assert.equal(JSON.parse(runRes.body).report.skipped, 'disabled')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
@@ -978,7 +995,7 @@ test('curator: disabled setting skips the pass; created conclusions get register
     t.fire(session, completedTurn)
     await new Promise((r) => setTimeout(r, 120))
     const statusRes = fakeRes()
-    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, statusRes)
+    await t.routes[0].handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=' }, statusRes)
     const row = JSON.parse(statusRes.body).curator.skills.find((r) => r.skill === 'curator-e2e')
     assert.ok(row, 'created skill must enter the managed set')
     assert.equal(row.state, 'active')
@@ -1404,7 +1421,7 @@ test('review fix: usage.json load merges with in-memory increments instead of cl
     t.fire(session, { type: 'tool/call', data: { name: 'skill', arguments: JSON.stringify({ name: 'merge-skill' }) } })
     await new Promise((r) => setTimeout(r, 60))
     const res = fakeRes()
-    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, res)
+    await t.routes[0].handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=' }, res)
     assert.equal(JSON.parse(res.body).usage.rows.find((r) => r.skill === 'merge-skill').count, 8,
       'in-memory increment during the load window must survive the disk load')
   } finally {
@@ -1459,7 +1476,7 @@ test('review fix: settings fallback path validates instead of raw Object.assign'
   const t = setupPlugin({}, services) // settings: undefined → 回退路径
   await new Promise((r) => setTimeout(r, 30))
   const res = fakeRes()
-  await t.routes[0].handler(postJson('/hermes-loop/api/settings', { patch: { mode: 'typo', cooldownMinutes: -1 } }), res)
+  await t.routes[0].handler(postJson('/api/hermes-loop/settings', { patch: { mode: 'typo', cooldownMinutes: -1 } }), res)
   const body = JSON.parse(res.body)
   assert.equal(res.statusCode, 200)
   assert.equal(body.settings.mode, 'auto', 'invalid mode must not fall into the auto write branch silently')
@@ -1787,7 +1804,7 @@ test('GET status exposes memory stores (enabled/chars/limit/entries) and the las
   try {
     const route = t.routes[0]
     const res = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status' }, res)
     const body = JSON.parse(res.body)
     assert.equal(res.statusCode, 200)
     assert.ok(body.memory && body.memory.stores)
@@ -1841,7 +1858,7 @@ test('v0.5 追加：status 的 memory.items 带只读条目原文', async () => 
   try {
     const route = t.routes[0]
     const res = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status' }, res)
     const body = JSON.parse(res.body)
     assert.deepEqual(body.memory.stores.memory.items, ['fact for items'])
     assert.deepEqual(body.memory.stores.user.items, [])

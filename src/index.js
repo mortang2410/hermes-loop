@@ -2329,7 +2329,7 @@ module.exports = {
       ctx.inject(['webServer'], (webServerCtx) => {
         ctx.effect(() => webServerCtx.webServer.register({
           kind: 'prefix',
-          path: '/hermes-loop/api',
+          path: '/api/hermes-loop',
           handler: async (req, res) => {
             // 与其它 host 路由一致的信任栅栏：connection 服务的 Host/Origin 检查
             // 加浏览器认证，防止本机任意网页跨站调用。
@@ -2342,13 +2342,13 @@ module.exports = {
             try {
               const url = new URL(req.url || '/', 'http://dsh.local')
               const apiPath = url.pathname.replace(/\/+$/, '')
-              if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/status')) {
+              if (req.method === 'GET' && apiPath.endsWith('/api/hermes-loop/status')) {
                 sendJson(res, 200, await loopSnapshot(url.searchParams.get('sessionId') || ''))
                 // 响应发出后才启动后台刷新：冷重扫的同步 IO 段不得堵在本响应的 flush 前面
                 kickInvocableIfStale()
                 return
               }
-              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/settings')) {
+              if (req.method === 'POST' && apiPath.endsWith('/api/hermes-loop/settings')) {
                 const body = await readJsonBody(req)
                 if (body === null || typeof body !== 'object' || body.patch === undefined || typeof body.patch !== 'object') {
                   sendJson(res, 400, { error: 'body must provide patch object' })
@@ -2364,7 +2364,7 @@ module.exports = {
                 return
               }
               // 手动"立即复盘"：绕过阈值/冷却，但仍走全局串行队列与前台取消
-              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/review-now')) {
+              if (req.method === 'POST' && apiPath.endsWith('/api/hermes-loop/review-now')) {
                 const body = await readJsonBody(req)
                 const sessionId = body && typeof body.sessionId === 'string' ? body.sessionId : ''
                 if (sessionId === '') { sendJson(res, 400, { error: 'body must provide sessionId' }); return }
@@ -2388,13 +2388,13 @@ module.exports = {
                 return
               }
               // Curator（§10.5）：立即巡检，绕过 interval 限制
-              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/curator/run')) {
+              if (req.method === 'POST' && apiPath.endsWith('/api/hermes-loop/curator/run')) {
                 const report = await runCuratorPass(true)
                 sendJson(res, 200, { ok: true, report })
                 return
               }
               // Curator：归档恢复（移除 disable-model-invocation + anchor 提到恢复时刻）
-              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/curator/restore')) {
+              if (req.method === 'POST' && apiPath.endsWith('/api/hermes-loop/curator/restore')) {
                 const body = await readJsonBody(req)
                 if (typeof body.name !== 'string' || !KEbab_NAME_RE.test(body.name)) { sendJson(res, 400, { error: 'body must provide a kebab-case skill name' }); return }
                 const out = await restoreManaged(body.name)
