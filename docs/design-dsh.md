@@ -295,8 +295,8 @@ curatorIntervalHours: 24  # 自动巡检的最小间隔；手动按钮不受限
 ```
 
 - status 快照新增 `curator` 节：`{ enabled, staleDays, archiveDays, lastRunAt, runCount, lastSummary, skills: [{ skill, state, createdAt, useCount, lastUsedAt, modelInvocable }] }`；
-- `POST /hermes-loop/api/curator/run` → 立即巡检，返回本次转移报告；
-- `POST /hermes-loop/api/curator/restore { name }` → 归档恢复。
+- `POST /api/hermes-loop/curator/run` → 立即巡检，返回本次转移报告；
+- `POST /api/hermes-loop/curator/restore { name }` → 归档恢复。
 
 ### 10.6 面板
 
