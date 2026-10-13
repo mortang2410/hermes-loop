@@ -204,6 +204,18 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   // And assert undefined explicitly means zh, so no caller needs a sentinel.
   assert.equal(zhAsUpstream(I.reviewPrompt({})), upstream().reviewPrompt({}))
 
+  // Position with memory on. The strip above removes the layout block wherever it
+  // sits, so a block moved before the priority section still matches upstream. The
+  // upstream comparison is left as it is; this adds the block's position in the
+  // prompt the model receives. Test 6 pins the position for both memory states.
+  const zhOn = I.reviewPrompt({ memoryEnabled: true, userProfileEnabled: true }, 'zh').split('\n')
+  const layout = I.REVIEW_LAYOUT_TEXT.zh
+  const layoutAt = zhOn.indexOf(layout[0])
+  assert.equal(layoutAt, zhOn.indexOf('## 命名纪律') + 4, 'with memory on, the zh layout block must follow the naming section')
+  assert.deepEqual(zhOn.slice(layoutAt, layoutAt + layout.length), layout, 'with memory on, the zh layout block is not where the protocol puts it')
+  assert.equal(zhOn[layoutAt + layout.length], '', 'with memory on, a blank line must separate the layout block from the memory section')
+  assert.ok(zhOn[layoutAt + layout.length + 1].startsWith('## 记忆'), 'with memory on, the memory section must follow the layout block')
+
   // The loop-aware section is injected into every session's system prompt and
   // upstream does not export it, so compare against the array it assembles —
   // read back out of upstream's source, not asserted as a substring of it.
