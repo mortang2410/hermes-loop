@@ -736,6 +736,8 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
     if (existing !== undefined && existing.isFile()) {
       return { result: 'create-conflict', detail: `skill '${conclusion.skill}' already exists; refusing to overwrite (merge is v3 Curator work)` }
     }
+    const pointer = await checkBodyPointers(targetDir, conclusion.body, files, { patch: false })
+    if (pointer !== undefined) return pointer
     const clash = await checkReferenceFiles(conclusion.skill, plan.writes)
     if (clash !== undefined) return clash
     const content = buildSkillMd(conclusion.skill, conclusion.description, conclusion.body)
@@ -762,6 +764,8 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
   const description = conclusion.baseDescription !== undefined && conclusion.baseDescription !== ''
     ? conclusion.baseDescription
     : descriptionOf(current) || ''
+  const pointer = await checkBodyPointers(targetDir, conclusion.body, files, { patch: true })
+  if (pointer !== undefined) return pointer
   const clash = await checkReferenceFiles(conclusion.skill, plan.writes)
   if (clash !== undefined) return clash
   const content = mergeFrontmatter(current, conclusion.skill, description, conclusion.body)
@@ -803,6 +807,34 @@ async function planReferenceFiles(targetDir, files) {
     writes.push({ rel: file.path, abs, content: file.content.replace(/\s+$/, '') + '\n', baseHash: file.baseHash })
   }
   return { writes }
+}
+
+// A body pointer is any "references/<name>" the SKILL.md body names. The name is
+// read with the characters a path may hold; an empty name (the layout placeholder
+// "references/<kebab-name>") is skipped, and trailing dots are stripped.
+const BODY_POINTER_RE = /references\/([A-Za-z0-9._/-]+)/g
+
+/**
+ * Every body pointer must be legitimate before any write. A pointer is legitimate
+ * when it is a path in this conclusion's files[], or, on patch only, when it is a
+ * regular reference file already on disk in a real references/ directory. Symlinks,
+ * directories, dangling links and names outside the reference form are refused,
+ * and so is any pointer on create that files[] does not carry.
+ * @returns {{result: 'rejected', detail: string} | undefined}
+ */
+async function checkBodyPointers(targetDir, body, files, { patch }) {
+  const names = new Set()
+  for (const m of String(body || '').matchAll(BODY_POINTER_RE)) {
+    const name = m[1].replace(/\.+$/, '')
+    if (name !== '') names.add(`references/${name}`)
+  }
+  const refsIsDir = patch && (await entryKind(join(targetDir, 'references'))) === 'dir'
+  for (const pointer of names) {
+    if (files.includes(pointer)) continue
+    if (refsIsDir && REFERENCE_PATH_RE.test(pointer) && (await entryKind(join(targetDir, pointer))) === 'file') continue
+    return { result: 'rejected', detail: `body names '${pointer}', which is neither in files[] nor an existing regular reference file` }
+  }
+  return undefined
 }
 
 /**
