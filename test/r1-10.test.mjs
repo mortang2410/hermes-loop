@@ -75,3 +75,23 @@ test('R1-10 unknown action: a valid memory entry is kept and the refusal is repo
   assert.equal(reasons.length, 1, 'the refused skill part must be reported once')
   assert.match(reasons[0], /unknown action/)
 })
+
+// Each remaining refusal arm of the skill part keeps a valid memory entry. The
+// unknown-action test above covers one arm; these cover the name, body, description
+// and baseHash arms of parseConclusion, each of which returns refuse(reason).
+const refusalArms = [
+  ['skill name is not kebab-case', { action: 'create', skill: 'Bad Name!', description: 'Use when probing.', body: '# probe\n' }],
+  ['body is empty or too long', { action: 'create', skill: 'r1-10-probe', description: 'Use when probing.', body: '   ' }],
+  ['create has no description', { action: 'create', skill: 'r1-10-probe', body: '# probe\n' }],
+  ['patch has no baseHash', { action: 'patch', skill: 'r1-10-probe', body: '# probe\n' }],
+]
+for (const [reason, skillPart] of refusalArms) {
+  test(`R1-10 memory arm: a refused skill part (${reason}) keeps the memory entry`, () => {
+    const reasons = []
+    const result = parseConclusion(fence({ ...skillPart, memory: memo }), (r) => reasons.push(r))
+    assert.notEqual(result, undefined, `memory must survive a refused skill part (${reason})`)
+    assert.equal(result.action, 'nothing', 'the skill part is dropped, leaving a memory-only conclusion')
+    assert.equal(result.memory?.text, 'likes terse answers', 'the valid memory entry must be kept')
+    assert.deepEqual(reasons, [reason], 'the refusal must be reported with its reason')
+  })
+}
