@@ -419,37 +419,44 @@ function parseReferenceFiles(raw) {
 
 /**
  * Parse a review conclusion. Anything malformed → undefined (fail-closed:
- * the caller logs and drops, per design §4). The optional `memory` field is
- * validated independently: a malformed memory sub-conclusion is dropped while
- * the skill conclusion survives (per-channel fail-closed, design §12.3).
+ * the caller logs and drops, per design §4). The memory field is parsed first and
+ * on its own (per-channel isolation, design-dsh.md:149; §12.3). A refused skill
+ * part never discards a valid memory sub-conclusion: the result is then a
+ * memory-only `nothing` conclusion. The skill conclusion stays all-or-nothing.
+ * @param {string} text the model's final message
+ * @param {(reason: string) => void} [onRefuse] called with the reason a skill part was refused
  */
-function parseConclusion(text) {
+function parseConclusion(text, onRefuse) {
   const jsonText = extractFencedJson(text)
   if (jsonText === undefined) return undefined
   let parsed
   try { parsed = JSON.parse(jsonText) } catch { return undefined }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
-  if (!['nothing', 'create', 'patch'].includes(parsed.action)) return undefined
   const memory = parseMemoryConclusion(parsed.memory)
+  const refuse = (reason) => {
+    if (typeof onRefuse === 'function') onRefuse(reason)
+    return memory !== undefined ? { action: 'nothing', rationale: '', memory } : undefined
+  }
+  if (!['nothing', 'create', 'patch'].includes(parsed.action)) return refuse(`unknown action ${JSON.stringify(parsed.action)}`)
   if (parsed.action === 'nothing') {
     const out = { action: 'nothing', rationale: typeof parsed.rationale === 'string' ? parsed.rationale : '' }
     if (memory !== undefined) out.memory = memory
     return out
   }
-  if (typeof parsed.skill !== 'string' || !KEbab_NAME_RE.test(parsed.skill)) return undefined
-  if (typeof parsed.body !== 'string' || parsed.body.trim() === '' || parsed.body.length > BODY_MAX_CHARS) return undefined
+  if (typeof parsed.skill !== 'string' || !KEbab_NAME_RE.test(parsed.skill)) return refuse('skill name is not kebab-case')
+  if (typeof parsed.body !== 'string' || parsed.body.trim() === '' || parsed.body.length > BODY_MAX_CHARS) return refuse('body is empty or too long')
   const files = parseReferenceFiles(parsed.files)
-  if (files === undefined) return undefined
+  if (files === undefined) return refuse('files is malformed')
   const conclusion = { action: parsed.action, skill: parsed.skill, body: parsed.body, rationale: typeof parsed.rationale === 'string' ? parsed.rationale : '' }
   if (parsed.action === 'create') {
-    if (typeof parsed.description !== 'string' || parsed.description.trim() === '') return undefined
+    if (typeof parsed.description !== 'string' || parsed.description.trim() === '') return refuse('create has no description')
     // 超长截断而非整体丢弃：模型对字符数的估计与 UTF-16 .length（emoji 算 2）
     // 有系统性偏差，一条其余全合法的结论不该因 description 略长而蒸发
     conclusion.description = parsed.description.trim().slice(0, DESCRIPTION_MAX)
   }
   if (parsed.action === 'patch') {
     // CAS inputs — writer re-reads the file and compares (design §6 step ①)
-    if (typeof parsed.baseHash !== 'string' || parsed.baseHash === '') return undefined
+    if (typeof parsed.baseHash !== 'string' || parsed.baseHash === '') return refuse('patch has no baseHash')
     conclusion.baseHash = parsed.baseHash
     if (typeof parsed.baseDescription === 'string') conclusion.baseDescription = parsed.baseDescription
   }
@@ -2198,7 +2205,9 @@ module.exports = {
         }
 
         // 6. conclusion → writer
-        const conclusion = parseConclusion(finalText)
+        const conclusion = parseConclusion(finalText, (reason) => {
+          ctx.logger.warn(`hermes-loop: review for session ${sessionId}: skill part refused (${reason}); memory part kept if valid`)
+        })
         if (conclusion === undefined) {
           trace('conclusion', { sessionId, action: 'unparseable', head: finalText.slice(0, 160).replace(/\s+/g, ' ') })
           ctx.logger.warn(`hermes-loop: unparseable review conclusion for session ${sessionId}; dropped (fail-closed). head=${finalText.slice(0, 120).replace(/\s+/g, ' ')}`)
