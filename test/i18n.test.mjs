@@ -440,6 +440,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
     referenceListed: 'listed only, full text not injected, cannot be edited this round',
     referenceUnreadable: 'cannot be read, full text not injected, cannot be edited this round',
+    tooLarge: 'too large to patch this round: full text and baseHash not shown',
   }, 'the English review input copy changed')
   // The directives are pinned verbatim, for the same reason as every other
   // model-facing string here: `prompt.includes(directive)` reads the very

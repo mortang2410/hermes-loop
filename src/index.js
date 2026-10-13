@@ -1164,6 +1164,7 @@ const REVIEW_INPUT_TEXT = {
     references: '该 skill 的 reference 文件（references/*.md；patch 时把每个文件的 baseHash 原样带回）',
     referenceListed: '仅列出，未注入全文，本轮不可修改',
     referenceUnreadable: '无法读取，未注入全文，本轮不可修改',
+    tooLarge: '正文超过长度上限，本轮不可修改（未注入全文，也没有 baseHash）',
   },
   en: {
     catalog: 'Existing skill catalog (name: description)',
@@ -1176,6 +1177,7 @@ const REVIEW_INPUT_TEXT = {
     references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
     referenceListed: 'listed only, full text not injected, cannot be edited this round',
     referenceUnreadable: 'cannot be read, full text not injected, cannot be edited this round',
+    tooLarge: 'too large to patch this round: full text and baseHash not shown',
   },
 }
 
@@ -2019,8 +2021,14 @@ module.exports = {
           const file = join(suspect.resourceBase.path, 'SKILL.md')
           let content
           try { content = await fsP.readFile(file, 'utf8') } catch { continue }
+          // A body over the suspect limit is never shown cut: a cut view under the
+          // full-file baseHash would let a patch replace the file with its visible
+          // part. Such a skill is listed as not editable this round.
+          if (content.length > SUSPECT_BODY_MAX_CHARS) {
+            suspectBlocks.push(`### suspect: ${suspect.name}\n${REVIEW_INPUT_TEXT[lang].tooLarge}`)
+            continue
+          }
           const hash = sha256(content)
-          if (content.length > SUSPECT_BODY_MAX_CHARS) content = content.slice(0, SUSPECT_BODY_MAX_CHARS) + REVIEW_INPUT_TEXT[lang].truncated
           // baseDescription 必须取文件全文里的完整值：目录构造时 description 被截断到
           // catalogDescriptionMax，用截断值做 CAS 基准会让长描述技能永远 cas-conflict
           // The suspect's reference files travel with it: full text (for patching) up to
