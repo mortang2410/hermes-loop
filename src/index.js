@@ -741,8 +741,8 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
     const clash = await checkReferenceFiles(conclusion.skill, plan.writes)
     if (clash !== undefined) return clash
     const content = buildSkillMd(conclusion.skill, conclusion.description, conclusion.body)
-    await writeReferenceFiles(plan.writes)
-    await atomicWrite(targetFile, content)
+    const failed = await commitConclusionFiles(plan.writes, targetFile, content)
+    if (failed !== undefined) return failed
     return { result: 'created', path: targetFile, files }
   }
 
@@ -779,8 +779,8 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
   const clash = await checkReferenceFiles(conclusion.skill, plan.writes)
   if (clash !== undefined) return clash
   const content = mergeFrontmatter(current, conclusion.skill, description, conclusion.body)
-  await writeReferenceFiles(plan.writes)
-  await atomicWrite(targetFile, content)
+  const failed = await commitConclusionFiles(plan.writes, targetFile, content)
+  if (failed !== undefined) return failed
   return { result: 'patched', path: targetFile, at: now, files }
 }
 
@@ -872,8 +872,83 @@ async function checkReferenceFiles(skill, writes) {
   return undefined
 }
 
-async function writeReferenceFiles(writes) {
-  for (const w of writes) await atomicWrite(w.abs, w.content)
+/**
+ * Write one conclusion's files as a unit. Every temp file is written before the
+ * first rename. Then the reference files are renamed in order and SKILL.md last,
+ * so a failure before SKILL.md leaves SKILL.md untouched. If a rename fails, the
+ * files already renamed are undone: a reference file this call overwrote gets its
+ * previous bytes back, and one this call created is removed. Every temp file is
+ * removed. Nothing is thrown; the caller gets a rejected result instead.
+ * @returns {Promise<{result: 'rejected', detail: string} | undefined>}
+ */
+async function commitConclusionFiles(refWrites, skillFile, skillContent) {
+  const items = [
+    ...refWrites.map((w) => ({ target: w.abs, content: w.content, label: w.rel })),
+    { target: skillFile, content: skillContent, label: 'SKILL.md' },
+  ]
+  const staged = []
+  const renamed = []
+  try {
+    for (const item of items) {
+      await fsP.mkdir(join(item.target, '..'), { recursive: true })
+      item.temp = join(join(item.target, '..'), `.${randomUUID()}.tmp`)
+      item.preImage = await readPreImage(item.target)
+      staged.push(item)
+      await fsP.writeFile(item.temp, item.content, 'utf8')
+    }
+    for (const item of items) {
+      await fsP.rename(item.temp, item.target)
+      renamed.push(item)
+    }
+    return undefined
+  } catch (e) {
+    const incomplete = await undoRenames(renamed)
+    for (const item of staged) await unlinkQuietly(item.temp)
+    const reason = e && e.message ? e.message : String(e)
+    const tail = incomplete.length > 0 ? ` Rollback incomplete for: ${incomplete.join(', ')}.` : ''
+    return { result: 'rejected', detail: `write failed (${reason}); the files of this conclusion were rolled back.${tail}` }
+  }
+}
+
+/** The bytes at `path` now, or undefined when nothing is there. Other errors throw. */
+async function readPreImage(path) {
+  try { return await fsP.readFile(path) } catch (e) {
+    if (e && e.code === 'ENOENT') return undefined
+    throw e
+  }
+}
+
+/**
+ * Undo renames in reverse order. A target that had a pre-image gets the old bytes
+ * back through a temp file and a rename. A target with no pre-image was created by
+ * this call and is removed.
+ * @returns {string[]} labels of the files that could not be put back.
+ */
+async function undoRenames(renamed) {
+  const incomplete = []
+  for (const item of [...renamed].reverse()) {
+    try {
+      if (item.preImage === undefined) {
+        await fsP.unlink(item.target)
+      } else {
+        const back = join(join(item.target, '..'), `.${randomUUID()}.tmp`)
+        try {
+          await fsP.writeFile(back, item.preImage)
+          await fsP.rename(back, item.target)
+        } finally {
+          await unlinkQuietly(back)
+        }
+      }
+    } catch {
+      incomplete.push(item.label)
+    }
+  }
+  return incomplete
+}
+
+/** Remove a temp file if it is still there. A file already renamed away is not an error. */
+async function unlinkQuietly(path) {
+  try { await fsP.unlink(path) } catch { /* already renamed or never created */ }
 }
 
 /**
