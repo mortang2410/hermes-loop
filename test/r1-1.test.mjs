@@ -10,7 +10,7 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const plugin = require('../src/index.js')
-const { sha256, buildSkillMd, applyConclusion } = plugin.__internals
+const { sha256, buildSkillMd, applyConclusion, REVIEW_INPUT_TEXT } = plugin.__internals
 
 const TAIL = 'TAIL-MARKER'
 const DESC = 'Use when testing the big skill.'
@@ -99,10 +99,12 @@ async function runReview(responseText) {
 test('R1-1 injection: the review prompt must not show a 21 KiB SKILL.md cut at 8 KiB under its full-file baseHash', async () => {
   const { prompt } = await runReview('```json\n{"action":"nothing"}\n```')
   assert.ok(prompt.includes('### suspect: big-skill'), 'harness check: the skill reached the review as a suspect')
-  assert.ok(
-    prompt.includes(TAIL) || !prompt.includes(`baseHash: ${sha256(FULL)}`),
-    'the suspect is shown cut at 8 KiB (tail missing) but carries the baseHash of the full file, so a patch can be built on text the review never saw in full',
-  )
+  // Over the 8 KiB limit the suspect is listed as too large: neither its body nor
+  // its full-file baseHash reaches the review. The earlier `||` form also passed
+  // when the whole body was injected, because the tail was then present.
+  assert.ok(!prompt.includes(TAIL), 'the full body was injected: the tail of the 21 KiB SKILL.md reached the review')
+  assert.ok(!prompt.includes(`baseHash: ${sha256(FULL)}`), 'the over-limit suspect carries the baseHash of the full file')
+  assert.ok(prompt.includes(REVIEW_INPUT_TEXT.zh.tooLarge), 'the over-limit suspect must be listed as too large to patch this round')
 })
 
 test('R1-1 writer: a patch whose body came from the 8 KiB view must not replace the 21 KiB SKILL.md and drop its tail', async () => {
