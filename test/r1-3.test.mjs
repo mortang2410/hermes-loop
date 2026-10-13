@@ -52,6 +52,9 @@ test('R1-3 red: no-baseHash patch over an existing unreadable reference file is 
   try {
     res = await applyConclusion(patchNoHash(fx), { globalDir: fx.globalDir })
   } finally { await fx.restore() }
+  // The result is pinned, not only the bytes: with the guard off, a later read
+  // refuses as 'rejected' and the bytes still match, so bytes alone do not bite.
+  assert.equal(res.result, 'create-conflict', `refused as '${res.result}', not by the unreadable-file guard`)
   assert.equal(await readFile(fx.file, 'utf8'), ORIGINAL, `writer returned '${res.result}' and overwrote an unseen file`)
 })
 
@@ -62,6 +65,7 @@ test('R1-3 red: same, with references/ also unreadable (reviewer FO1 case)', { s
   try {
     res = await applyConclusion(patchNoHash(fx), { globalDir: fx.globalDir })
   } finally { await fx.restore() }
+  assert.equal(res.result, 'create-conflict', `refused as '${res.result}', not by the unreadable-file guard`)
   assert.equal(await readFile(fx.file, 'utf8'), ORIGINAL, `writer returned '${res.result}' and overwrote an unseen file`)
 })
 
@@ -76,6 +80,7 @@ test('R1-3 red: no-baseHash create over an existing unreadable reference file in
       body: '# topic\nSee references/setup.md.\n', files: [{ path: 'references/setup.md', content: NEW }],
     }, { globalDir: fx.globalDir })
   } finally { await fx.restore() }
+  assert.equal(res.result, 'create-conflict', `refused as '${res.result}', not by the unreadable-file guard`)
   assert.equal(await readFile(fx.file, 'utf8'), ORIGINAL, `writer returned '${res.result}' and overwrote an unseen file`)
 })
 
