@@ -543,6 +543,21 @@ function descriptionOf(skillMdContent) {
   return value
 }
 
+/**
+ * 剥掉 frontmatter 返回正文（无 frontmatter 原样返回）——面板技能内容查看用。
+ * 渲染走 Markdown，frontmatter 的 name/description 已由弹窗单独展示，正文里
+ * 再出现一份 YAML 是噪音。
+ */
+function stripFrontmatter(raw) {
+  const text = String(raw || '')
+  const lines = text.split(/\r?\n/)
+  if (lines[0] === undefined || lines[0].trim() !== '---') return text
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === '---') return lines.slice(i + 1).join('\n').replace(/^\s+/, '')
+  }
+  return text
+}
+
 /** temp file + rename in the same directory → readers never see a half file. */
 async function atomicWrite(targetFile, content) {
   await fsP.mkdir(join(targetFile, '..'), { recursive: true })
@@ -1124,7 +1139,7 @@ module.exports = {
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, parseMemoryConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
-    descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
+    descriptionOf, stripFrontmatter, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
     setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
     settingsSchema, Config,
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
@@ -1933,6 +1948,11 @@ module.exports = {
           invocableCache = {
             at: Date.now(),
             map: new Map((snapshot.skills || []).map((s) => [s.name, !(s.invocation && s.invocation.modelInvocable === false)])),
+            // 目录投影（面板技能内容查看用）：name → resourceBase 目录，含项目级
+            // 技能。与 map 同一次快照产出、同生同灭；目录型才有，单文件技能不投影。
+            dirs: new Map((snapshot.skills || [])
+              .filter((s) => s.resourceBase && s.resourceBase.kind === 'directory' && typeof s.resourceBase.path === 'string')
+              .map((s) => [s.name, s.resourceBase.path])),
           }
         } catch { /* 刷新失败：保留旧缓存，下轮再试 */ }
         finally { invocableInflight = null }
@@ -1941,6 +1961,30 @@ module.exports = {
     }
     const kickInvocableIfStale = () => {
       if (invocableCache === null || Date.now() - invocableCache.at > INVOCABLE_TTL_MS) refreshInvocable()
+    }
+    // 技能内容读取（GET /skill，面板「查看」按钮的数据源；借鉴 skills-management
+    // 的 detail 通道，只读不写）。解析顺序：① invocableCache 目录投影（含项目级
+    // 技能，随快照 60s 刷新）② 全局库直读（writer/curator 的地盘，缓存未热时也
+    // 可见）。①是 Map 等值查找不经路径拼接；②按名字拼路径，调用方必须先过
+    // kebab 校验。两处都读不到 → undefined（路由回 404）。
+    const panelSkillPayload = (name, dir, raw) => ({
+      name,
+      path: dir,
+      description: descriptionOf(raw) || '',
+      content: stripFrontmatter(raw),
+    })
+    const readSkillForPanel = async (name) => {
+      if (invocableCache !== null) {
+        const base = invocableCache.dirs.get(name)
+        if (base !== undefined) {
+          const raw = await fsP.readFile(join(base, 'SKILL.md'), 'utf8').catch(() => undefined)
+          if (raw !== undefined) return panelSkillPayload(name, base, raw)
+        }
+      }
+      if (!KEbab_NAME_RE.test(name)) return undefined
+      const dir = join(globalSkillsDir(), name)
+      const raw = await fsP.readFile(join(dir, 'SKILL.md'), 'utf8').catch(() => undefined)
+      return raw === undefined ? undefined : panelSkillPayload(name, dir, raw)
     }
     const sendJson = (res, status, payload) => {
       res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
@@ -2225,6 +2269,16 @@ module.exports = {
                 const out = await restoreManaged(body.name)
                 if (out.status !== undefined) { sendJson(res, out.status, { error: out.message }); return }
                 sendJson(res, 200, out)
+                return
+              }
+              // 技能内容查看（面板「查看」按钮）：?name= 只接受 kebab-case——全局库
+              // 回退按名字拼路径，先挡掉路径逃逸。不存在回 404，弹窗原地展示错误。
+              if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/skill')) {
+                const name = url.searchParams.get('name') || ''
+                if (!KEbab_NAME_RE.test(name)) { sendJson(res, 400, { error: 'query must provide a kebab-case skill name' }); return }
+                const skill = await readSkillForPanel(name)
+                if (skill === undefined) { sendJson(res, 404, { error: `skill '${name}' not found` }); return }
+                sendJson(res, 200, skill)
                 return
               }
               sendJson(res, 404, { error: 'not found' })

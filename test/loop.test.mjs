@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url)
 const plugin = require('../src/index.js')
 const {
   reasonKind, contentToText, renderTranscript, rankSuspects, parseConclusion,
-  sha256, buildSkillMd, mergeFrontmatter, applyConclusion, descriptionOf, DEFAULTS,
+  sha256, buildSkillMd, mergeFrontmatter, applyConclusion, descriptionOf, stripFrontmatter, DEFAULTS,
 } = plugin.__internals
 
 // ── reasonKind ──────────────────────────────────────────────────────────
@@ -97,6 +97,19 @@ test('buildSkillMd emits valid frontmatter and descriptionOf round-trips it', ()
   assert.equal(descriptionOf(content), 'does things')
   const quoted = buildSkillMd('my-skill', 'has "quotes" and\nnewline', 'b')
   assert.equal(descriptionOf(quoted), 'has "quotes" and newline')
+})
+
+test('stripFrontmatter returns the body and passes plain content through', () => {
+  // 面板「查看」弹窗的正文来源：frontmatter 单独展示（description），正文进
+  // Markdown 渲染——YAML 头再出现一份是噪音。
+  const withMeta = buildSkillMd('my-skill', 'does things', '## Body\n\ntext\n')
+  assert.equal(stripFrontmatter(withMeta), '## Body\n\ntext\n')
+  // 无 frontmatter（或首行缩进破坏了定界符）→ 原样返回
+  assert.equal(stripFrontmatter('plain body\n'), 'plain body\n')
+  assert.equal(stripFrontmatter(''), '')
+  assert.equal(stripFrontmatter(undefined), '')
+  // frontmatter 未闭合 → 整体视为正文，绝不吞半个文件
+  assert.equal(stripFrontmatter('---\nname: x\nno closer\n'), '---\nname: x\nno closer\n')
 })
 
 // ── applyConclusion (real filesystem, temp globalDir) ───────────────────
@@ -386,6 +399,81 @@ test('GET /status never blocks on a slow skills.snapshot (panel opens instantly)
     await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-slow' }, res2)
     const row2 = JSON.parse(res2.body).usage.rows.find((r) => r.skill === 'slow-skill')
     assert.equal(row2.modelInvocable, false)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('GET /hermes-loop/api/skill serves SKILL.md content from snapshot dirs and the global fallback', async () => {
+  // 面板「查看」按钮的数据源：① invocableCache 目录投影（含项目级技能）
+  // ② 全局库直读。坏名字 400、两处都读不到 404。
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-skillview-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    // 全局库技能（writer/curator 的地盘）
+    await mkdir(join(home, 'skills', 'panel-skill'), { recursive: true })
+    await writeFile(
+      join(home, 'skills', 'panel-skill', 'SKILL.md'),
+      '---\nname: "panel-skill"\ndescription: "global library skill"\n---\n\n## Procedure\n\nglobal body\n')
+    // 项目级技能：只存在于快照 resourceBase 指向的目录，不在全局库
+    const projDir = await mkdtemp(join(tmpdir(), 'hermes-loop-proj-'))
+    await mkdir(projDir, { recursive: true })
+    await writeFile(join(projDir, 'SKILL.md'), '---\nname: "proj-skill"\ndescription: "project skill"\n---\n\n## Procedure\n\nproject body\n')
+
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    services.skills = {
+      snapshot: async () => ({
+        skills: [
+          { name: 'proj-skill', description: 'project skill', invocation: { modelInvocable: true }, resourceBase: { kind: 'directory', path: projDir } },
+          { name: 'file-skill', resourceBase: { kind: 'file', path: '/x/file-skill.md' } },
+        ],
+        complete: true,
+      }),
+    }
+    const t = setupPlugin({}, services)
+    await new Promise((r) => setTimeout(r, 30))
+    const route = t.routes[0]
+    // 先打一次 /status 触发后台快照刷新，等它落地（single-flight，30ms 足够）
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, fakeRes())
+    await new Promise((r) => setTimeout(r, 50))
+
+    // ① 快照投影：项目级技能也能看
+    const projRes = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=proj-skill' }, projRes)
+    assert.equal(projRes.statusCode, 200)
+    const proj = JSON.parse(projRes.body)
+    assert.equal(proj.name, 'proj-skill')
+    assert.equal(proj.path, projDir)
+    assert.equal(proj.description, 'project skill')
+    assert.equal(proj.content, '## Procedure\n\nproject body\n', 'frontmatter must be stripped from the rendered body')
+
+    // ② 全局库回退：不在快照里的技能直读全局库
+    const globalRes = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=panel-skill' }, globalRes)
+    assert.equal(globalRes.statusCode, 200)
+    const globalBody = JSON.parse(globalRes.body)
+    assert.equal(globalBody.description, 'global library skill')
+    assert.equal(globalBody.content, '## Procedure\n\nglobal body\n')
+
+    // 单文件型 resourceBase 不投影，全局库也没有 → 404（错误进弹窗）
+    const fileRes = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=file-skill' }, fileRes)
+    assert.equal(fileRes.statusCode, 404)
+
+    // 缺失技能 404；坏名字（路径逃逸载体）400；缺名字 400
+    const missing = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=ghost-skill' }, missing)
+    assert.equal(missing.statusCode, 404)
+    const escape = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=..%2Fescape' }, escape)
+    assert.equal(escape.statusCode, 400)
+    const noName = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill' }, noName)
+    assert.equal(noName.statusCode, 400)
+    await rm(projDir, { recursive: true, force: true })
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome

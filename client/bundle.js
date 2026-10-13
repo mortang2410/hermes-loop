@@ -14,6 +14,14 @@ window.__ModuleLoader__.load({
     var React = require('react')
     var h = React.createElement
 
+    // 宿主 Markdown 渲染原语（skills-management 详情弹窗同源）：渲染 SKILL.md 正文。
+    // 原语缺席（版本漂移/测试环境）时退回 pre 纯文本，弹窗功能不受影响。
+    var MarkdownText = null
+    try {
+      var uiPrim = require('@deepseek-ai/dsh-client-ui-primitives')
+      if (uiPrim && typeof uiPrim.MarkdownText === 'function') MarkdownText = uiPrim.MarkdownText
+    } catch (e) { MarkdownText = null }
+
     var DICT = {
       zh: {
         tab: 'Hermes Loop',
@@ -96,6 +104,15 @@ window.__ModuleLoader__.load({
         'memory.lastWrite': '最近写入',
         'memory.view': '查看条目',
         'memory.hide': '收起',
+        view: '查看',
+        close: '关闭',
+        'skillContent.failed': '内容加载失败',
+        'md.copy': '复制内容',
+        'md.copied': '已复制',
+        'md.code': '代码',
+        'md.wrap': '自动换行',
+        'md.unwrap': '取消换行',
+        'md.footnotes': '脚注',
       },
       en: {
         tab: 'Hermes Loop',
@@ -178,6 +195,15 @@ window.__ModuleLoader__.load({
         'memory.lastWrite': 'last write',
         'memory.view': 'View entries',
         'memory.hide': 'Collapse',
+        view: 'View',
+        close: 'Close',
+        'skillContent.failed': 'Failed to load content',
+        'md.copy': 'Copy content',
+        'md.copied': 'Copied',
+        'md.code': 'Code',
+        'md.wrap': 'Wrap lines',
+        'md.unwrap': 'No wrap',
+        'md.footnotes': 'Footnotes',
       },
     }
 
@@ -215,6 +241,15 @@ window.__ModuleLoader__.load({
       '.hl-help::after{content:attr(data-tip);position:absolute;top:calc(100% + 8px);right:-6px;z-index:60;width:min(360px,72vw);white-space:normal;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-1,inherit);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:10px 12px;font-size:12px;font-weight:400;line-height:1.7;text-align:left;box-shadow:0 6px 20px rgba(0,0,0,.25);opacity:0;pointer-events:none;transition:opacity .12s}',
       '.hl-help:hover::after{opacity:1}',
       '.hl-input{background:var(--dsw-alias-bg-layer-1,transparent);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;padding:2px 8px;font-size:12px;color:inherit}',
+      // 技能内容查看按钮 + 弹窗（结构借鉴 skills-management 的 SkDialog）
+      '.hl-view{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;padding:0 7px;font-size:11px;line-height:1.6;cursor:pointer;background:transparent;color:inherit;font-family:inherit}',
+      '.hl-view:hover{background:var(--dsw-alias-bg-layer-3,rgba(128,128,128,.2))}',
+      '.hl-dlg-backdrop{position:fixed;inset:0;z-index:2147483200;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:24px}',
+      '.hl-dlg{background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:12px;min-width:320px;max-width:880px;width:88vw;max-height:82vh;overflow:auto;padding:16px;box-shadow:0 10px 40px rgba(0,0,0,.35);color:var(--dsw-alias-label-1,inherit)}',
+      '.hl-dlg-title{margin:0 0 8px;display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;font-family:ui-monospace,monospace;word-break:break-all}',
+      '.hl-dlg-desc{margin:0 0 10px;opacity:.7;font-size:12px;line-height:1.6}',
+      '.hl-dlg-body{max-height:58vh;overflow:auto;border:1px solid var(--dsw-alias-border-l3,rgba(128,128,128,.15));border-radius:8px;padding:12px;background:var(--dsw-alias-bg-layer-1,transparent);font-size:12.5px;line-height:1.7}',
+      '.hl-dlg-foot{display:flex;justify-content:flex-end;margin-top:10px}',
     ].join('')
 
     var fmtTime = function (iso) {
@@ -240,6 +275,69 @@ window.__ModuleLoader__.load({
     }
 
     var makeView = function (t) {
+      // 技能内容弹窗（逻辑借鉴 skills-management 的 DetailModal + SkDialog）：
+      // backdrop 点击/Esc 关闭、内容区 stopPropagation；经 /api/skill 拉取正文，
+      // MarkdownText 原语缺席时退回 pre 纯文本。
+      var SkillContentDialog = function (props) {
+        var _ld = React.useState(null)
+        var data = _ld[0]
+        var setData = _ld[1]
+        var _le = React.useState(null)
+        var failed = _le[0]
+        var setFailed = _le[1]
+        React.useEffect(function () {
+          var alive = true
+          setData(null)
+          setFailed(null)
+          fetch('/hermes-loop/api/skill?name=' + encodeURIComponent(props.name))
+            .then(function (r) {
+              return r.json().then(function (d) { return { ok: r.ok === true, body: d } })
+            })
+            .then(function (out) {
+              if (!alive) return
+              if (out.ok && out.body && typeof out.body.content === 'string') setData(out.body)
+              else setFailed((out.body && out.body.error) || 'HTTP ' + '?')
+            })
+            .catch(function (e) { if (alive) setFailed(String(e && e.message || e)) })
+          return function () { alive = false }
+        }, [props.name])
+        React.useEffect(function () {
+          var onKey = function (e) { if (e.key === 'Escape') props.onClose() }
+          try { document.addEventListener('keydown', onKey) } catch (e) { /* 无 document（测试环境） */ }
+          return function () { try { document.removeEventListener('keydown', onKey) } catch (e) {} }
+        }, [])
+        // MarkdownText 的 labels 是宿主必填（正文含 ``` 围栏时缺失会抛 TypeError，
+        // 见 skills-management markdownLabels 注释），且要求按文案引用稳定。
+        var labels = React.useMemo(function () {
+          return {
+            code: {
+              copyLabel: t('md.copy'),
+              copiedLabel: t('md.copied'),
+              toolbarLabels: { codeLabel: t('md.code'), wrapLabel: t('md.wrap'), unwrapLabel: t('md.unwrap') },
+            },
+            footnotes: t('md.footnotes'),
+          }
+        }, [t('md.copy'), t('md.copied'), t('md.code'), t('md.wrap'), t('md.unwrap'), t('md.footnotes')])
+        return h('div', { className: 'hl-dlg-backdrop', onClick: props.onClose },
+          h('div', { className: 'hl-dlg', onClick: function (e) { e.stopPropagation() } },
+            h('div', { className: 'hl-dlg-title' },
+              h('span', null, props.name),
+              h('span', { className: 'hl-tag' }, 'SKILL.md')),
+            failed !== null
+              ? h('div', { className: 'hl-err' }, t('skillContent.failed') + ': ' + failed)
+              : data === null
+                ? h('div', { className: 'hl-mut hl-loading' }, t('loading'))
+                : [
+                  data.description ? h('p', { key: 'd', className: 'hl-dlg-desc' }, data.description) : null,
+                  h('div', { key: 'b', className: 'hl-dlg-body' },
+                    MarkdownText !== null
+                      ? h(MarkdownText, { text: data.content, labels: labels })
+                      : h('pre', { style: { whiteSpace: 'pre-wrap', margin: 0, fontFamily: 'ui-monospace,monospace', fontSize: '11.5px' } }, data.content)),
+                ],
+            h('div', { className: 'hl-dlg-foot' },
+              h('button', { className: 'hl-chip', onClick: props.onClose }, t('close')))))
+      }
+
       return function HermesLoopView(props) {
         var sessionId = props.sessionId
         var _s = React.useState(null)
@@ -260,6 +358,10 @@ window.__ModuleLoader__.load({
         var _mx = React.useState(false)
         var memoryExpanded = _mx[0]
         var setMemoryExpanded = _mx[1]
+        var _sv = React.useState(null)
+        var viewing = _sv[0]
+        var setViewing = _sv[1]
+        var openSkill = function (name) { if (name) setViewing(String(name)) }
 
         React.useEffect(function () {
           var alive = true
@@ -470,6 +572,7 @@ window.__ModuleLoader__.load({
                   return h('li', { key: i },
                     h('span', { className: 'hl-tag' }, t('action.' + (w.action || 'create'))),
                     h('span', { className: 'hl-skill' }, w.skill),
+                    h('button', { className: 'hl-view', title: t('view'), onClick: function () { openSkill(w.skill) } }, t('view')),
                     h('span', { className: 'hl-mut' }, fmtDate(w.at)),
                     w.result && w.result !== 'created' && w.result !== 'patched'
                       ? h('span', { className: 'hl-err hl-mut' }, w.result) : null,
@@ -499,7 +602,9 @@ window.__ModuleLoader__.load({
                         var zombie = row.count === 0
                         var statusText = row.modelInvocable === undefined ? '—' : (row.modelInvocable ? t('usage.modelVisible') : t('usage.modelDisabled'))
                         return h('tr', { key: i, style: zombie ? { opacity: .6 } : null },
-                          h('td', { className: 'hl-skill' }, row.skill),
+                          h('td', null,
+                            h('span', { className: 'hl-skill' }, row.skill),
+                            h('button', { className: 'hl-view', style: { marginLeft: '6px' }, title: t('view'), onClick: function () { openSkill(row.skill) } }, t('view'))),
                           h('td', null, zombie ? h('span', { className: 'hl-help hl-mut', 'data-tip': t('usage.statusHelp') }, '—') : row.count),
                           h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtDate(row.lastUsedAt) : h('span', { className: 'hl-help', 'data-tip': t('usage.statusHelp') }, '—')),
                           h('td', null, h('span', { className: 'hl-tag' + (row.modelInvocable === false ? ' hl-err' : '') }, statusText)))
@@ -535,7 +640,9 @@ window.__ModuleLoader__.load({
                       h('th', null, ''))),
                     h('tbody', null, skills.map(function (row, i) {
                       return h('tr', { key: i, style: row.state !== 'active' ? { opacity: .75 } : null },
-                        h('td', { className: 'hl-skill' }, row.skill),
+                        h('td', null,
+                          h('span', { className: 'hl-skill' }, row.skill),
+                          h('button', { className: 'hl-view', style: { marginLeft: '6px' }, title: t('view'), onClick: function () { openSkill(row.skill) } }, t('view'))),
                         h('td', null, h('span', { className: 'hl-tag' + (row.state === 'archived' ? ' hl-err' : '') },
                           t('curator.state.' + row.state))),
                         h('td', null, row.useCount),
@@ -605,6 +712,11 @@ window.__ModuleLoader__.load({
                 : null,
               totalEntries === 0 ? h('div', { className: 'hl-mut' }, t('memory.empty')) : null)
           })(),
+
+          // 技能内容弹窗（三处「查看」按钮共用）
+          viewing !== null
+            ? h(SkillContentDialog, { name: viewing, onClose: function () { setViewing(null) } })
+            : null,
         )
       }
     }
