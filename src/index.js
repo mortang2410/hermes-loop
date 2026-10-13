@@ -866,7 +866,13 @@ async function listReferenceFiles(skillDir) {
     if (!REFERENCE_NAME_RE.test(name)) continue
     const abs = join(dir, name)
     if ((await entryKind(abs)) !== 'file') continue
-    const content = await fsP.readFile(abs, 'utf8')
+    let content
+    try { content = await fsP.readFile(abs, 'utf8') } catch {
+      // One unreadable file must not abort the review: it is listed by name only,
+      // so the review can neither see nor patch it.
+      files.push({ path: `references/${name}`, unreadable: true })
+      continue
+    }
     files.push({ path: `references/${name}`, content, baseHash: sha256(content) })
   }
   return files
@@ -885,6 +891,7 @@ function renderReferenceBlock(files, lang) {
   let shown = 0
   let budget = REFERENCE_INJECT_MAX_CHARS
   const parts = files.map((f) => {
+    if (f.unreadable) return `- ${f.path} (${T.referenceUnreadable})`
     if (shown < REFERENCE_FILES_MAX && f.content.length <= REFERENCE_FILE_MAX_CHARS && f.content.length <= budget) {
       shown += 1
       budget -= f.content.length
@@ -1124,6 +1131,7 @@ const REVIEW_INPUT_TEXT = {
     truncated: '\n…（截断）',
     references: '该 skill 的 reference 文件（references/*.md；patch 时把每个文件的 baseHash 原样带回）',
     referenceListed: '仅列出，未注入全文，本轮不可修改',
+    referenceUnreadable: '无法读取，未注入全文，本轮不可修改',
   },
   en: {
     catalog: 'Existing skill catalog (name: description)',
@@ -1135,6 +1143,7 @@ const REVIEW_INPUT_TEXT = {
     truncated: '\n… (truncated)',
     references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
     referenceListed: 'listed only, full text not injected, cannot be edited this round',
+    referenceUnreadable: 'cannot be read, full text not injected, cannot be edited this round',
   },
 }
 
