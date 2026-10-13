@@ -105,3 +105,44 @@ test('R1-1 injection: the review prompt must not show a 21 KiB SKILL.md cut at 8
   )
 })
 
+test('R1-1 writer: a patch whose body came from the 8 KiB view must not replace the 21 KiB SKILL.md and drop its tail', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'r1-1-writer-'))
+  const g = join(home, 'skills')
+  await mkdir(join(g, 'big-skill'), { recursive: true })
+  await writeFile(join(g, 'big-skill', 'SKILL.md'), FULL)
+  const res = await applyConclusion(
+    { action: 'patch', skill: 'big-skill', body: PATCHED_BODY, rationale: 'r1-1', baseHash: sha256(FULL), baseDescription: DESC, files: [] },
+    { globalDir: g },
+  )
+  const after = await readFile(join(g, 'big-skill', 'SKILL.md'), 'utf8')
+  assert.ok(
+    res.result !== 'patched' || after.includes(TAIL),
+    `expected a refusal or the tail kept; got result=${res.result}, tail ${after.includes(TAIL) ? 'kept' : 'LOST'}, file ${FULL.length} -> ${after.length} chars`,
+  )
+})
+
+test('R1-1 end to end: a patch answering the 8 KiB view must not land and drop the tail', async () => {
+  const conclusion = JSON.stringify({ action: 'patch', skill: 'big-skill', body: PATCHED_BODY, baseHash: sha256(FULL), baseDescription: DESC })
+  const { skillDir } = await runReview('```json\n' + conclusion + '\n```')
+  const after = await readFile(join(skillDir, 'SKILL.md'), 'utf8')
+  assert.ok(
+    after === FULL || after.includes(TAIL),
+    `expected the file unchanged or the tail kept; file ${FULL.length} -> ${after.length} chars, tail ${after.includes(TAIL) ? 'kept' : 'LOST'}`,
+  )
+})
+
+// Marker: a body that carries the review's truncation marker is a patch built on
+// a cut view, so it is refused even when the file is within the limit.
+test('R1-1 writer: a body carrying the truncation marker is refused, nothing written', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'r1-1-marker-'))
+  const g = join(home, 'skills')
+  const SHORT = buildSkillMd('short-skill', DESC, '# short\nbody v1\n')
+  await mkdir(join(g, 'short-skill'), { recursive: true })
+  await writeFile(join(g, 'short-skill', 'SKILL.md'), SHORT)
+  const res = await applyConclusion(
+    { action: 'patch', skill: 'short-skill', body: '# short\nbody v2\n…（截断）\n', rationale: 'r1-1 marker', baseHash: sha256(SHORT), baseDescription: DESC, files: [] },
+    { globalDir: g },
+  )
+  assert.equal(res.result, 'rejected', `expected rejected; got ${res.result}`)
+  assert.equal(await readFile(join(g, 'short-skill', 'SKILL.md'), 'utf8'), SHORT, 'SKILL.md must not change')
+})

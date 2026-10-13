@@ -764,6 +764,16 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
   const description = conclusion.baseDescription !== undefined && conclusion.baseDescription !== ''
     ? conclusion.baseDescription
     : descriptionOf(current) || ''
+  // A patch is a full-file rewrite. Built from a cut view (the review shows at most
+  // SUSPECT_BODY_MAX_CHARS of a suspect, and marks a cut), it would drop the tail.
+  if (current.length > SUSPECT_BODY_MAX_CHARS) {
+    return { result: 'rejected', detail: `skill '${conclusion.skill}' is longer than ${SUSPECT_BODY_MAX_CHARS} characters; a patch built from a cut view would drop its tail` }
+  }
+  // The review's cut marker (both languages). A body that carries it was built from a cut view.
+  const cutMarkers = [REVIEW_INPUT_TEXT.zh.truncated, REVIEW_INPUT_TEXT.en.truncated].map((m) => m.trim())
+  if (cutMarkers.some((m) => String(conclusion.body || '').includes(m))) {
+    return { result: 'rejected', detail: `the body of '${conclusion.skill}' carries the review's truncation marker; refusing a patch built from a cut view` }
+  }
   const pointer = await checkBodyPointers(targetDir, conclusion.body, files, { patch: true })
   if (pointer !== undefined) return pointer
   const clash = await checkReferenceFiles(conclusion.skill, plan.writes)
