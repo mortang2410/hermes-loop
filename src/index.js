@@ -807,14 +807,21 @@ async function planReferenceFiles(targetDir, files) {
 
 /**
  * Per-file compare-and-swap. A file with a baseHash must still hash to it; a
- * file without one must not exist yet. Reports the first file that disagrees,
- * by its relative path, and writes nothing.
+ * file without one must not exist yet. Only ENOENT counts as "missing": any other
+ * read error means the file may exist but was never shown to the review, so the
+ * write is refused. Reports the first file that disagrees, by its relative path,
+ * and writes nothing.
  */
 async function checkReferenceFiles(skill, writes) {
   for (const w of writes) {
     let current
-    try { current = await fsP.readFile(w.abs, 'utf8') } catch { current = undefined }
+    let unreadable = false
+    try { current = await fsP.readFile(w.abs, 'utf8') } catch (e) {
+      if (!e || e.code !== 'ENOENT') unreadable = true
+      current = undefined
+    }
     if (w.baseHash === undefined) {
+      if (unreadable) return { result: 'create-conflict', detail: `reference file '${w.rel}' of '${skill}' exists but cannot be read; refusing to overwrite it` }
       if (current !== undefined) return { result: 'create-conflict', detail: `reference file '${w.rel}' of '${skill}' already exists` }
     } else if (current === undefined || sha256(current) !== w.baseHash) {
       return { result: 'cas-conflict', detail: `reference file '${w.rel}' of '${skill}' changed since the review read it` }
