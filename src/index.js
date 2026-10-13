@@ -146,6 +146,14 @@ function createLanguageResolver({ read, schedule, retries = LANGUAGE_RETRIES }) 
 }
 const BODY_MAX_CHARS = 128 * 1024
 const SUSPECT_BODY_MAX_CHARS = 8 * 1024
+// Reference files: sub-topic notes under a skill's references/ directory. The
+// router never indexes them, so they carry detail the SKILL.md body points to.
+const REFERENCE_FILE_MAX_CHARS = 32 * 1024
+const REFERENCE_FILES_MAX = 8
+// Full text of one suspect's reference files shown to the review, in total.
+const REFERENCE_INJECT_MAX_CHARS = 32 * 1024
+const REFERENCE_PATH_RE = /^references\/[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
+const REFERENCE_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 const TRANSCRIPT_MESSAGE_CAP = 40
 const TRANSCRIPT_MESSAGE_CHARS = 4000
 // ── Memory 通道（design §12，v0.5）──
@@ -384,6 +392,32 @@ function parseMemoryConclusion(raw) {
 }
 
 /**
+ * Validate the optional `files` array of a create/patch conclusion. Absent or
+ * null yields []. Any malformed entry fails the whole conclusion: a SKILL.md
+ * body that points at a reference file must never land without that file, or
+ * with only part of the set.
+ */
+function parseReferenceFiles(raw) {
+  if (raw === undefined || raw === null) return []
+  if (!Array.isArray(raw) || raw.length > REFERENCE_FILES_MAX) return undefined
+  const seen = new Set()
+  const files = []
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return undefined
+    if (typeof item.path !== 'string' || !REFERENCE_PATH_RE.test(item.path) || seen.has(item.path)) return undefined
+    if (typeof item.content !== 'string' || item.content.trim() === '' || item.content.length > REFERENCE_FILE_MAX_CHARS) return undefined
+    const file = { path: item.path, content: item.content }
+    if (item.baseHash !== undefined && item.baseHash !== null) {
+      if (typeof item.baseHash !== 'string' || item.baseHash === '') return undefined
+      file.baseHash = item.baseHash
+    }
+    seen.add(item.path)
+    files.push(file)
+  }
+  return files
+}
+
+/**
  * Parse a review conclusion. Anything malformed → undefined (fail-closed:
  * the caller logs and drops, per design §4). The optional `memory` field is
  * validated independently: a malformed memory sub-conclusion is dropped while
@@ -404,6 +438,8 @@ function parseConclusion(text) {
   }
   if (typeof parsed.skill !== 'string' || !KEbab_NAME_RE.test(parsed.skill)) return undefined
   if (typeof parsed.body !== 'string' || parsed.body.trim() === '' || parsed.body.length > BODY_MAX_CHARS) return undefined
+  const files = parseReferenceFiles(parsed.files)
+  if (files === undefined) return undefined
   const conclusion = { action: parsed.action, skill: parsed.skill, body: parsed.body, rationale: typeof parsed.rationale === 'string' ? parsed.rationale : '' }
   if (parsed.action === 'create') {
     if (typeof parsed.description !== 'string' || parsed.description.trim() === '') return undefined
@@ -417,6 +453,7 @@ function parseConclusion(text) {
     conclusion.baseHash = parsed.baseHash
     if (typeof parsed.baseDescription === 'string') conclusion.baseDescription = parsed.baseDescription
   }
+  if (files.length > 0) conclusion.files = files
   if (memory !== undefined) conclusion.memory = memory
   return conclusion
 }
@@ -678,14 +715,20 @@ function mergeFrontmatter(existingContent, name, description, newBody) {
 
 /**
  * Validate and apply a conclusion to the filesystem.
- * Guards, in order: create-onto-existing downgrade; patch CAS re-read;
- * atomic temp-file rename. Never writes outside `globalDir`.
+ * Guards, in order: reference-file path and size plan (nothing is written if it
+ * fails); create-onto-existing downgrade; patch CAS re-read of SKILL.md; per-file
+ * CAS of every reference file; then the writes, reference files first and
+ * SKILL.md last, so SKILL.md never names a file not yet on disk. Each write is an
+ * atomic temp-file rename. Never writes outside the target skill directory.
  * @returns a short result descriptor (for logs and the caller's bookkeeping).
  */
 async function applyConclusion(conclusion, { globalDir, now = new Date().toISOString() } = {}) {
   if (conclusion.action === 'nothing') return { result: 'nothing' }
   const targetDir = join(globalDir, conclusion.skill)
   const targetFile = join(targetDir, 'SKILL.md')
+  const plan = await planReferenceFiles(targetDir, conclusion.files || [])
+  if (plan.error !== undefined) return { result: 'rejected', detail: plan.error }
+  const files = plan.writes.map((w) => w.rel)
 
   if (conclusion.action === 'create') {
     let existing
@@ -693,9 +736,12 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
     if (existing !== undefined && existing.isFile()) {
       return { result: 'create-conflict', detail: `skill '${conclusion.skill}' already exists; refusing to overwrite (merge is v3 Curator work)` }
     }
+    const clash = await checkReferenceFiles(conclusion.skill, plan.writes)
+    if (clash !== undefined) return clash
     const content = buildSkillMd(conclusion.skill, conclusion.description, conclusion.body)
+    await writeReferenceFiles(plan.writes)
     await atomicWrite(targetFile, content)
-    return { result: 'created', path: targetFile }
+    return { result: 'created', path: targetFile, files }
   }
 
   // patch — CAS: re-read right before writing; a mismatch means the skill
@@ -716,9 +762,130 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
   const description = conclusion.baseDescription !== undefined && conclusion.baseDescription !== ''
     ? conclusion.baseDescription
     : descriptionOf(current) || ''
+  const clash = await checkReferenceFiles(conclusion.skill, plan.writes)
+  if (clash !== undefined) return clash
   const content = mergeFrontmatter(current, conclusion.skill, description, conclusion.body)
+  await writeReferenceFiles(plan.writes)
   await atomicWrite(targetFile, content)
-  return { result: 'patched', path: targetFile, at: now }
+  return { result: 'patched', path: targetFile, at: now, files }
+}
+
+/**
+ * Plan the reference-file writes of one conclusion before any byte is written.
+ * parseConclusion checks the same rules, but applyConclusion also runs on
+ * conclusions staged for approval, so the writer checks them again. Links are
+ * never followed: a symlinked references/ or a symlinked file is refused, so a
+ * write cannot leave the skill directory.
+ * @returns {{writes: Array<{rel: string, abs: string, content: string, baseHash?: string}>} | {error: string}}
+ */
+async function planReferenceFiles(targetDir, files) {
+  if (files.length > REFERENCE_FILES_MAX) return { error: `more than ${REFERENCE_FILES_MAX} reference files in one conclusion` }
+  if (files.length > 0 && !['missing', 'dir'].includes(await entryKind(join(targetDir, 'references')))) {
+    return { error: 'references/ of the target skill is a symlink or not a directory' }
+  }
+  const root = resolve(targetDir) + sep
+  const seen = new Set()
+  const writes = []
+  for (const file of files) {
+    if (typeof file.path !== 'string' || !REFERENCE_PATH_RE.test(file.path)) {
+      return { error: `reference path '${file.path}' must be references/<kebab-name>.md` }
+    }
+    if (seen.has(file.path)) return { error: `reference path '${file.path}' appears twice` }
+    seen.add(file.path)
+    const abs = resolve(targetDir, file.path)
+    if (!abs.startsWith(root)) return { error: `reference path '${file.path}' escapes the skill directory` }
+    if (typeof file.content !== 'string' || file.content.trim() === '' || file.content.length > REFERENCE_FILE_MAX_CHARS) {
+      return { error: `reference file '${file.path}' is empty or longer than ${REFERENCE_FILE_MAX_CHARS} characters` }
+    }
+    if (!['missing', 'file'].includes(await entryKind(abs))) {
+      return { error: `reference file '${file.path}' is a symlink or a non-regular entry` }
+    }
+    writes.push({ rel: file.path, abs, content: file.content.replace(/\s+$/, '') + '\n', baseHash: file.baseHash })
+  }
+  return { writes }
+}
+
+/**
+ * Per-file compare-and-swap. A file with a baseHash must still hash to it; a
+ * file without one must not exist yet. Reports the first file that disagrees,
+ * by its relative path, and writes nothing.
+ */
+async function checkReferenceFiles(skill, writes) {
+  for (const w of writes) {
+    let current
+    try { current = await fsP.readFile(w.abs, 'utf8') } catch { current = undefined }
+    if (w.baseHash === undefined) {
+      if (current !== undefined) return { result: 'create-conflict', detail: `reference file '${w.rel}' of '${skill}' already exists` }
+    } else if (current === undefined || sha256(current) !== w.baseHash) {
+      return { result: 'cas-conflict', detail: `reference file '${w.rel}' of '${skill}' changed since the review read it` }
+    }
+  }
+  return undefined
+}
+
+async function writeReferenceFiles(writes) {
+  for (const w of writes) await atomicWrite(w.abs, w.content)
+}
+
+/**
+ * What kind of entry sits at `path`. lstat never follows the final link, so a
+ * symlink reports 'other'. 'missing' only for ENOENT.
+ * @returns {'missing' | 'file' | 'dir' | 'other'}
+ */
+async function entryKind(path) {
+  try {
+    const st = await fsP.lstat(path)
+    if (st.isFile()) return 'file'
+    if (st.isDirectory()) return 'dir'
+    return 'other'
+  } catch (e) {
+    return e && e.code === 'ENOENT' ? 'missing' : 'other'
+  }
+}
+
+/**
+ * The reference files a review may see: regular files directly under references/
+ * with kebab-case .md names. The directory must be a real directory, or readdir
+ * would follow a symlink out of the skill. Each file carries the baseHash a
+ * patch must echo.
+ */
+async function listReferenceFiles(skillDir) {
+  const dir = join(skillDir, 'references')
+  if ((await entryKind(dir)) !== 'dir') return []
+  let names
+  try { names = await fsP.readdir(dir) } catch { return [] }
+  const files = []
+  for (const name of names.sort()) {
+    if (!REFERENCE_NAME_RE.test(name)) continue
+    const abs = join(dir, name)
+    if ((await entryKind(abs)) !== 'file') continue
+    const content = await fsP.readFile(abs, 'utf8')
+    files.push({ path: `references/${name}`, content, baseHash: sha256(content) })
+  }
+  return files
+}
+
+/**
+ * Review-input text for one skill's reference files. Full text, with the baseHash
+ * to echo, goes to files in name order while three limits hold: at most
+ * REFERENCE_FILES_MAX files, each within REFERENCE_FILE_MAX_CHARS, and the running
+ * total within REFERENCE_INJECT_MAX_CHARS. Every other file is named only, because
+ * the review must not patch a file whose full text it has not seen.
+ */
+function renderReferenceBlock(files, lang) {
+  if (files.length === 0) return ''
+  const T = REVIEW_INPUT_TEXT[lang]
+  let shown = 0
+  let budget = REFERENCE_INJECT_MAX_CHARS
+  const parts = files.map((f) => {
+    if (shown < REFERENCE_FILES_MAX && f.content.length <= REFERENCE_FILE_MAX_CHARS && f.content.length <= budget) {
+      shown += 1
+      budget -= f.content.length
+      return `#### ${f.path}\nbaseHash: ${f.baseHash}\n\n${f.content}`
+    }
+    return `- ${f.path} (${T.referenceListed})`
+  })
+  return `${T.references}\n\n${parts.join('\n\n')}`
 }
 
 function descriptionOf(skillMdContent) {
@@ -948,6 +1115,8 @@ const REVIEW_INPUT_TEXT = {
     transcriptTruncated: '…（早段已按保尾策略截断）',
     emptyCatalog: '（当前无可用 skill）',
     truncated: '\n…（截断）',
+    references: '该 skill 的 reference 文件（references/*.md；patch 时把每个文件的 baseHash 原样带回）',
+    referenceListed: '仅列出，未注入全文，本轮不可修改',
   },
   en: {
     catalog: 'Existing skill catalog (name: description)',
@@ -957,6 +1126,8 @@ const REVIEW_INPUT_TEXT = {
     transcriptTruncated: '…(earlier messages dropped; tail kept)',
     emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
+    references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
+    referenceListed: 'listed only, full text not injected, cannot be edited this round',
   },
 }
 
@@ -1088,6 +1259,34 @@ const REVIEW_LANGUAGE_DIRECTIVE = {
   zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写、技能目录或记忆条目本身用什么语言无关。',
   en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.',
 }
+/**
+ * Layout rules for topic skills and reference files, shared by the review prompt
+ * in both languages. Kept as one named block so the zh parity oracle in
+ * test/i18n.test.mjs can strip exactly this block, the way it strips the
+ * directive line, and nothing else.
+ */
+const REVIEW_LAYOUT_TEXT = {
+  zh: [
+    '## 布局：topic skill 与 reference 文件',
+    '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
+    '- 经验是某个既有 topic skill 的子主题（一个具体流程、工具用法、踩坑集）→ 写入该 skill 的 references/<kebab-name>.md（放入 files 字段），并在 SKILL.md 正文里加一行指向它；',
+    '- 只改 topic skill 的概述、适用范围或触发条件 → 只改 SKILL.md 正文；',
+    '- 确实是新的宽主题，且没有任何既有 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
+    `- files 最多 ${REFERENCE_FILES_MAX} 个，每个不超过 ${REFERENCE_FILE_MAX_CHARS} 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时把注入的 baseHash 原样带回；新建文件省略 baseHash；只能修改已注入全文的文件。`,
+    '输出 JSON 中可选的 files 字段（create 或 patch 均可）：',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<注入的 reference baseHash 原样带回；新建文件省略>" }]',
+  ],
+  en: [
+    '## Layout: topic skills and reference files',
+    'The skill router indexes only the name and the first 400 characters of each skill\'s description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.',
+    '- A finding is a sub-topic of an existing topic skill (one concrete procedure, tool usage, or pitfall set) → write it to references/<kebab-name>.md of that skill (in the files field), and add one line to the SKILL.md body that points to it;',
+    '- A change to the topic skill\'s overview, scope, or trigger conditions → edit the SKILL.md body only;',
+    '- A genuinely new broad topic that no existing skill can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
+    `- files holds at most ${REFERENCE_FILES_MAX} entries, each at most ${REFERENCE_FILE_MAX_CHARS} characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, echo its injected baseHash; omit baseHash for a new file; edit only files whose full text was injected.`,
+    'The optional files field of the output JSON, for create or patch:',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<echo the injected reference baseHash; omit for a new file>" }]',
+  ],
+}
 const REVIEW_PROMPT_TEXT = {
   zh: (memoryOn) => [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
@@ -1116,6 +1315,8 @@ const REVIEW_PROMPT_TEXT = {
     '## 命名纪律',
     'kebab-case class-level 名字。禁止 PR 号、错误串、一次性代号（fix-X / debug-Y 之类）。',
     '如果名字只对今天的任务有意义，那就是错的——回到优先序 1/2 去扩写既有 skill。',
+    '',
+    ...REVIEW_LAYOUT_TEXT.zh,
     ...(memoryOn ? [
       '',
       '## 记忆（可选结论——多数复盘应该没有记忆）',
@@ -1183,6 +1384,8 @@ const REVIEW_PROMPT_TEXT = {
     '## Naming discipline',
     'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
     'If the name only makes sense for today\'s task, it is wrong — go back to priority 1/2 and extend an existing skill instead.',
+    '',
+    ...REVIEW_LAYOUT_TEXT.en,
     ...(memoryOn ? [
       '',
       '## Memory (optional conclusion — most reviews should produce none)',
@@ -1279,6 +1482,7 @@ module.exports = {
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, parseMemoryConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
+    listReferenceFiles, renderReferenceBlock, REFERENCE_FILE_MAX_CHARS, REFERENCE_FILES_MAX, REVIEW_LAYOUT_TEXT,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
     setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
     settingsSchema, Config,
@@ -1771,7 +1975,10 @@ module.exports = {
           if (content.length > SUSPECT_BODY_MAX_CHARS) content = content.slice(0, SUSPECT_BODY_MAX_CHARS) + REVIEW_INPUT_TEXT[lang].truncated
           // baseDescription 必须取文件全文里的完整值：目录构造时 description 被截断到
           // catalogDescriptionMax，用截断值做 CAS 基准会让长描述技能永远 cas-conflict
-          suspectBlocks.push(`### suspect: ${suspect.name}\nbaseHash: ${hash}\nbaseDescription: ${JSON.stringify(descriptionOf(content) || '')}\n\n${content}`)
+          // The suspect's reference files travel with it: full text (for patching) up to
+          // the caps, names only for the rest. See renderReferenceBlock.
+          const references = renderReferenceBlock(await listReferenceFiles(suspect.resourceBase.path), lang)
+          suspectBlocks.push(`### suspect: ${suspect.name}\nbaseHash: ${hash}\nbaseDescription: ${JSON.stringify(descriptionOf(content) || '')}\n\n${content}${references ? `\n\n${references}` : ''}`)
         }
 
         // 4. 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
@@ -1885,6 +2092,7 @@ module.exports = {
           delete conclusion.skill
           delete conclusion.body
           delete conclusion.description
+          delete conclusion.files
         }
         await dispatchConclusion(conclusion, { eff, sessionId, session })
       } catch (e) {

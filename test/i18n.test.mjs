@@ -152,6 +152,17 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     assert.ok(text.endsWith(line), 'the zh prompt must end with the output-language directive')
     return text.slice(0, -line.length)
   }
+  // The reference-file layout block (REVIEW_LAYOUT_TEXT.zh, review fix m6rf) is a
+  // second declared addition, handled the same way as the directive: its exact
+  // text is removed, and it must occur exactly once. The blank line before it and
+  // the one after it collapse to a single newline, which is the spacing upstream
+  // uses where the block was absent, so the surrounding text still compares exactly.
+  const stripLayout = (text) => {
+    const span = '\n\n' + I.REVIEW_LAYOUT_TEXT.zh.join('\n') + '\n'
+    assert.equal(text.split(span).length, 2, 'the zh layout block must occur exactly once')
+    return text.replace(span, '\n')
+  }
+  const zhAsUpstream = (text) => stripLayout(stripDirective(text))
   for (const eff of [
     { memoryEnabled: true, userProfileEnabled: true },
     { memoryEnabled: true, userProfileEnabled: false },
@@ -160,11 +171,11 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     {},
   ]) {
     assert.equal(
-      stripDirective(I.reviewPrompt(eff)),
+      zhAsUpstream(I.reviewPrompt(eff)),
       upstream().reviewPrompt(eff),
       `zh output drifted from upstream for ${JSON.stringify(eff)}`,
     )
-    assert.equal(stripDirective(I.reviewPrompt(eff, 'zh')), upstream().reviewPrompt(eff))
+    assert.equal(zhAsUpstream(I.reviewPrompt(eff, 'zh')), upstream().reviewPrompt(eff))
   }
 
   // The memory snapshot is injected into every session rather than only into the
@@ -191,7 +202,7 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   }
 
   // And assert undefined explicitly means zh, so no caller needs a sentinel.
-  assert.equal(stripDirective(I.reviewPrompt({})), upstream().reviewPrompt({}))
+  assert.equal(zhAsUpstream(I.reviewPrompt({})), upstream().reviewPrompt({}))
 
   // The loop-aware section is injected into every session's system prompt and
   // upstream does not export it, so compare against the array it assembles —
@@ -335,7 +346,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
   // a bare field-name substring list would also pass a prompt that had lost the
   // fence, the per-field `required for` annotations, or the enums.
   for (const [text, label] of [[en, 'en'], [zh, 'zh']]) {
-    for (const field of ['"action"', '"skill"', '"description"', '"body"', '"baseHash"', '"baseDescription"', '"rationale"', '"memory"', '"store"', '"text"', '"oldText"']) {
+    for (const field of ['"action"', '"skill"', '"description"', '"body"', '"baseHash"', '"baseDescription"', '"files"', '"path"', '"rationale"', '"memory"', '"store"', '"text"', '"oldText"']) {
       assert.ok(text.includes(field), `${label}: output contract field missing: ${field}`)
     }
     assert.ok(text.includes('```json'), `${label}: the protocol must be a fenced json block`)
@@ -384,12 +395,12 @@ test('the review prompt switches wholesale and keeps its contract', () => {
   const enSections = I.REVIEW_PROMPT_TEXT.en(true).filter((l) => l.startsWith('## '))
   assert.deepEqual(
     zhSections.map((l) => l.slice(3).replace(/（[^）]*）/g, '')),
-    ['主动倾向', '正向信号', '负面清单', '优先序', '命名纪律', '记忆', '分工', '输出协议'],
+    ['主动倾向', '正向信号', '负面清单', '优先序', '命名纪律', '布局：topic skill 与 reference 文件', '记忆', '分工', '输出协议'],
     'the zh review protocol lost or reordered a section',
   )
   assert.deepEqual(
     enSections.map((l) => l.slice(3).replace(/\s*\([^)]*\)/g, '')),
-    ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Memory', 'Division of labour', 'Output protocol'],
+    ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Layout: topic skills and reference files', 'Memory', 'Division of labour', 'Output protocol'],
     'the en review protocol lost or reordered a section',
   )
   // Every dictionary the call sites index must carry both languages.
@@ -426,6 +437,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     transcriptTruncated: '…(earlier messages dropped; tail kept)',
     emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
+    references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
+    referenceListed: 'listed only, full text not injected, cannot be edited this round',
   }, 'the English review input copy changed')
   // The directives are pinned verbatim, for the same reason as every other
   // model-facing string here: `prompt.includes(directive)` reads the very
@@ -482,6 +495,15 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
     "If the name only makes sense for today's task, it is wrong — go back to priority 1/2 and extend an existing skill instead.",
     '',
+    '## Layout: topic skills and reference files',
+    "The skill router indexes only the name and the first 400 characters of each skill's description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.",
+    '- A finding is a sub-topic of an existing topic skill (one concrete procedure, tool usage, or pitfall set) → write it to references/<kebab-name>.md of that skill (in the files field), and add one line to the SKILL.md body that points to it;',
+    "- A change to the topic skill's overview, scope, or trigger conditions → edit the SKILL.md body only;",
+    '- A genuinely new broad topic that no existing skill can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
+    '- files holds at most 8 entries, each at most 32768 characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, echo its injected baseHash; omit baseHash for a new file; edit only files whose full text was injected.',
+    'The optional files field of the output JSON, for create or patch:',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<echo the injected reference baseHash; omit for a new file>" }]',
+    '',
     '## Memory (optional conclusion — most reviews should produce none)',
     'Besides skills, consider writing memory only when the conversation **explicitly** surfaced:',
     '- user profile, preferences, expectations about how you behave → store="user";',
@@ -516,14 +538,25 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     I.REVIEW_LANGUAGE_DIRECTIVE.en,
   ], 'the English review prompt changed')
   const enOff = I.REVIEW_PROMPT_TEXT.en(false)
-  assert.equal(enOff.length, 44, 'the English memory-off prompt must drop exactly the two memory blocks')
+  assert.equal(enOff.length, 53, 'the English memory-off prompt must drop exactly the two memory blocks')
   assert.ok(!enOff.some((l) => l.startsWith('## Memory')), 'no memory guidance section when memory is off')
   assert.ok(!enOff.some((l) => l.includes('"memory":')), 'no memory conclusion schema when memory is off')
   assert.deepEqual(
-    enOff.slice(26, 29),
+    enOff.slice(35, 38),
     ['## Division of labour', 'Processes, steps, pitfalls → skill. User profile/preference information is not distilled this round.', ''],
     'the English memory-off division-of-labour line must say memory is not distilled',
   )
+})
+
+test('the review prompt teaches the topic-skill / reference split in both languages', () => {
+  const eff = { memoryEnabled: true, userProfileEnabled: true }
+  const en = I.reviewPrompt(eff, 'en')
+  const zh = I.reviewPrompt(eff, 'zh')
+  for (const [text, label] of [[en, 'en'], [zh, 'zh']]) {
+    assert.ok(text.includes('references/<kebab-name>.md'), `${label}: the reference path rule is missing`)
+    assert.ok(text.includes('400'), `${label}: the router's 400-character indexing limit is missing`)
+  }
+  assert.match(en, /only the name and the first 400 characters/)
 })
 
 test('each review prompt pins the artifact language to its own language', () => {

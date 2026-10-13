@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, writeFile, mkdir, rm, readdir } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile, mkdir, rm, readdir, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
@@ -14,6 +14,7 @@ const plugin = require('../src/index.js')
 const {
   reasonKind, contentToText, renderTranscript, rankSuspects, parseConclusion,
   sha256, buildSkillMd, mergeFrontmatter, applyConclusion, descriptionOf, DEFAULTS,
+  listReferenceFiles, renderReferenceBlock, REFERENCE_FILE_MAX_CHARS, REFERENCE_FILES_MAX,
 } = plugin.__internals
 
 // ── reasonKind ──────────────────────────────────────────────────────────
@@ -151,6 +152,187 @@ test('applyConclusion: patch passes CAS when unchanged, fails when file drifted'
       { globalDir: dir })
     assert.equal(missing.result, 'patch-missing')
   } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+// ── reference files: multi-file conclusions (review fix m6rf) ──────────
+
+const TOPIC_SKILL_MD = '---\nname: "topic-skill"\ndescription: "orig"\n---\n\nbody v1\n'
+
+async function topicSkillDir(globalDir) {
+  await mkdir(join(globalDir, 'topic-skill', 'references'), { recursive: true })
+  await writeFile(join(globalDir, 'topic-skill', 'SKILL.md'), TOPIC_SKILL_MD)
+  await writeFile(join(globalDir, 'topic-skill', 'references', 'setup.md'), 'setup v1\n')
+}
+
+test('parseConclusion accepts a multi-file patch and keeps each file with its own baseHash', () => {
+  const text = JSON.stringify({
+    action: 'patch', skill: 'topic-skill', body: 'body v2', baseHash: 'aa', baseDescription: 'orig',
+    files: [
+      { path: 'references/new-topic.md', content: '# New topic\nsteps' },
+      { path: 'references/setup.md', content: 'setup v2', baseHash: 'bb' },
+    ],
+  })
+  const c = parseConclusion(text)
+  assert.ok(c, 'a multi-file patch must be accepted')
+  assert.equal(c.files.length, 2)
+  assert.equal(c.files[0].path, 'references/new-topic.md')
+  assert.equal(c.files[0].baseHash, undefined, 'a new file carries no baseHash')
+  assert.equal(c.files[1].baseHash, 'bb')
+})
+
+test('parseConclusion rejects every reference path outside references/<kebab-name>.md', () => {
+  const bad = ['../escape.md', '/etc/passwd.md', 'references/../../escape.md', 'SKILL.md',
+    'references/sub/nested.md', 'references/Bad_Name.md', 'references/notes.txt', 'references/.hidden.md']
+  for (const path of bad) {
+    const text = JSON.stringify({ action: 'create', skill: 'topic-skill', description: 'd', body: 'b', files: [{ path, content: 'x' }] })
+    assert.equal(parseConclusion(text), undefined, `path accepted: ${path}`)
+  }
+})
+
+test('parseConclusion rejects an oversized reference file and too many files', () => {
+  const big = 'x'.repeat(REFERENCE_FILE_MAX_CHARS + 1)
+  assert.equal(parseConclusion(JSON.stringify({ action: 'create', skill: 'a-b', description: 'd', body: 'b', files: [{ path: 'references/big.md', content: big }] })), undefined)
+  const many = Array.from({ length: REFERENCE_FILES_MAX + 1 }, (_, i) => ({ path: `references/f${i}.md`, content: 'x' }))
+  assert.equal(parseConclusion(JSON.stringify({ action: 'create', skill: 'a-b', description: 'd', body: 'b', files: many })), undefined)
+})
+
+test('applyConclusion writes a reference file only under the target skill references/', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await topicSkillDir(dir)
+    const out = await applyConclusion({
+      action: 'patch', skill: 'topic-skill', body: 'body v2', baseHash: sha256(TOPIC_SKILL_MD), baseDescription: 'orig',
+      files: [
+        { path: 'references/new-topic.md', content: '# New topic\n' },
+        { path: 'references/setup.md', content: 'setup v2\n', baseHash: sha256('setup v1\n') },
+      ],
+    }, { globalDir: dir })
+    assert.equal(out.result, 'patched')
+    assert.equal(await readFile(join(dir, 'topic-skill', 'references', 'new-topic.md'), 'utf8'), '# New topic\n')
+    assert.equal(await readFile(join(dir, 'topic-skill', 'references', 'setup.md'), 'utf8'), 'setup v2\n')
+    assert.match(await readFile(join(dir, 'topic-skill', 'SKILL.md'), 'utf8'), /body v2/)
+    assert.deepEqual((await readdir(join(dir, 'topic-skill'))).sort(), ['SKILL.md', 'references'])
+    assert.deepEqual((await readdir(dir)).sort(), ['topic-skill'], 'nothing outside the target skill directory')
+
+    const created = await applyConclusion({
+      action: 'create', skill: 'fresh-skill', description: 'd', body: 'b',
+      files: [{ path: 'references/first.md', content: 'first\n' }],
+    }, { globalDir: dir })
+    assert.equal(created.result, 'created')
+    assert.equal(await readFile(join(dir, 'fresh-skill', 'references', 'first.md'), 'utf8'), 'first\n')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('applyConclusion rejects an escaping reference path and writes nothing', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await topicSkillDir(dir)
+    const base = { action: 'patch', skill: 'topic-skill', body: 'body v2', baseHash: sha256(TOPIC_SKILL_MD), baseDescription: 'orig' }
+    for (const path of ['../escape.md', 'references/../../escape.md', '/etc/escape.md', 'SKILL.md']) {
+      const out = await applyConclusion({ ...base, files: [{ path, content: 'x\n' }] }, { globalDir: dir })
+      assert.equal(out.result, 'rejected', `path not rejected: ${path}`)
+    }
+    assert.equal(await readFile(join(dir, 'topic-skill', 'SKILL.md'), 'utf8'), TOPIC_SKILL_MD, 'SKILL.md must not change')
+    assert.deepEqual(await readdir(dir), ['topic-skill'])
+    assert.deepEqual(await readdir(join(dir, 'topic-skill', 'references')), ['setup.md'])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('applyConclusion rejects a references/ symlink that points outside the skill', async () => {
+  const dir = await tempGlobalDir()
+  const outside = await tempGlobalDir()
+  try {
+    await mkdir(join(dir, 'topic-skill'), { recursive: true })
+    await writeFile(join(dir, 'topic-skill', 'SKILL.md'), TOPIC_SKILL_MD)
+    await symlink(outside, join(dir, 'topic-skill', 'references'))
+    const out = await applyConclusion({
+      action: 'patch', skill: 'topic-skill', body: 'body v2', baseHash: sha256(TOPIC_SKILL_MD), baseDescription: 'orig',
+      files: [{ path: 'references/esc.md', content: 'x\n' }],
+    }, { globalDir: dir })
+    assert.equal(out.result, 'rejected')
+    assert.deepEqual(await readdir(outside), [], 'the symlink target must stay untouched')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    await rm(outside, { recursive: true, force: true })
+  }
+})
+
+test('applyConclusion reports a per-file CAS conflict, names the file, and changes nothing', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await topicSkillDir(dir)
+    // Another writer edits one reference file after this review read it.
+    await writeFile(join(dir, 'topic-skill', 'references', 'setup.md'), 'setup edited by someone else\n')
+    const out = await applyConclusion({
+      action: 'patch', skill: 'topic-skill', body: 'body v2', baseHash: sha256(TOPIC_SKILL_MD), baseDescription: 'orig',
+      files: [
+        { path: 'references/new-topic.md', content: '# New\n' },
+        { path: 'references/setup.md', content: 'setup v2\n', baseHash: sha256('setup v1\n') },
+      ],
+    }, { globalDir: dir })
+    assert.equal(out.result, 'cas-conflict')
+    assert.match(out.detail, /references\/setup\.md/, 'the conflict must name the file')
+    assert.equal(await readFile(join(dir, 'topic-skill', 'SKILL.md'), 'utf8'), TOPIC_SKILL_MD)
+    assert.deepEqual(await readdir(join(dir, 'topic-skill', 'references')), ['setup.md'], 'no partial write')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('applyConclusion refuses a new reference file whose path already exists', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await topicSkillDir(dir)
+    const out = await applyConclusion({
+      action: 'patch', skill: 'topic-skill', body: 'body v2', baseHash: sha256(TOPIC_SKILL_MD), baseDescription: 'orig',
+      files: [{ path: 'references/setup.md', content: 'x\n' }],
+    }, { globalDir: dir })
+    assert.equal(out.result, 'create-conflict')
+    assert.match(out.detail, /references\/setup\.md/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('an oversized reference file is rejected by the writer and writes nothing', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    const out = await applyConclusion({
+      action: 'create', skill: 'big-skill', description: 'd', body: 'b',
+      files: [{ path: 'references/big.md', content: 'x'.repeat(REFERENCE_FILE_MAX_CHARS + 1) }],
+    }, { globalDir: dir })
+    assert.equal(out.result, 'rejected')
+    assert.deepEqual(await readdir(dir), [])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('listReferenceFiles returns only regular, kebab-named .md files under references/', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await topicSkillDir(dir)
+    const refs = join(dir, 'topic-skill', 'references')
+    await writeFile(join(refs, 'Bad_Name.md'), 'x')
+    await writeFile(join(refs, 'notes.txt'), 'x')
+    await mkdir(join(refs, 'nested.md'))
+    await writeFile(join(dir, 'outside.md'), 'secret')
+    await symlink(join(dir, 'outside.md'), join(refs, 'linked.md'))
+    const listed = await listReferenceFiles(join(dir, 'topic-skill'))
+    assert.deepEqual(listed.map((r) => r.path), ['references/setup.md'])
+    assert.equal(listed[0].content, 'setup v1\n')
+    assert.equal(listed[0].baseHash, sha256('setup v1\n'))
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('renderReferenceBlock injects full text for at most REFERENCE_FILES_MAX files and lists the rest', () => {
+  const refs = Array.from({ length: REFERENCE_FILES_MAX + 1 }, (_, i) => ({
+    path: `references/r${i}.md`, content: `body ${i}\n`, baseHash: sha256(`body ${i}\n`),
+  }))
+  const text = renderReferenceBlock(refs, 'en')
+  assert.equal((text.match(/baseHash:/g) || []).length, REFERENCE_FILES_MAX, 'full text only up to the cap')
+  assert.match(text, new RegExp(`references/r${REFERENCE_FILES_MAX}\\.md`), 'the extra file is still listed')
+  assert.equal(renderReferenceBlock([], 'en'), '')
+
+  // A per-suspect total budget: two 20 KiB files cannot both be shown in full.
+  const big = (path) => ({ path, content: 'y'.repeat(20 * 1024), baseHash: sha256(path) })
+  const budgeted = renderReferenceBlock([big('references/a.md'), big('references/b.md')], 'en')
+  assert.equal((budgeted.match(/baseHash:/g) || []).length, 1, 'the second file would exceed the total budget, so it is only listed')
+  assert.match(budgeted, /references\/b\.md/)
 })
 
 // ── end-to-end through apply(): fake services drive a full review ───────
@@ -1120,6 +1302,46 @@ test('review fix: patch succeeds for skills with description longer than the cat
     t.fire(session, completedTurn)
     await new Promise((r) => setTimeout(r, 120))
     assert.match(await readFile(join(skillDir, 'SKILL.md'), 'utf8'), /patched body/, 'long-description skill must be patchable')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix m6rf: a suspect reference file reaches the prompt with its baseHash, and a multi-file patch lands', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-refs-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const skillDir = join(home, 'skills', 'topic-skill')
+    await mkdir(join(skillDir, 'references'), { recursive: true })
+    const description = 'topic overview for deploy work'
+    const original = `---\nname: "topic-skill"\ndescription: "${description}"\n---\n\nbody v1\n`
+    await writeFile(join(skillDir, 'SKILL.md'), original)
+    await writeFile(join(skillDir, 'references', 'setup.md'), 'setup v1\n')
+    const conclusion = JSON.stringify({
+      action: 'patch', skill: 'topic-skill', body: 'body v2', baseHash: sha256(original), baseDescription: description,
+      files: [
+        { path: 'references/setup.md', content: 'setup v2\n', baseHash: sha256('setup v1\n') },
+        { path: 'references/rollback.md', content: '# Rollback\nsteps\n' },
+      ],
+    })
+    const catalog = [provided({ name: 'topic-skill', description, resourceBase: { kind: 'directory', path: skillDir }, invocation: { modelInvocable: true } })]
+    const services = fakeServices('```json\n' + conclusion + '\n```', { agentSkills: catalogService(catalog) })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-refs', header: {}, deriveMessages: () => [{ role: 'user', content: 'we used topic-skill for deploys' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    const followup = services.created.find((c) => c && c.content)
+    const prompt = followup.content[0].text
+    assert.ok(
+      prompt.includes(`#### references/setup.md\nbaseHash: ${sha256('setup v1\n')}\n\nsetup v1`),
+      'the suspect reference file must reach the review with the baseHash it has to echo',
+    )
+    assert.equal(await readFile(join(skillDir, 'references', 'setup.md'), 'utf8'), 'setup v2\n')
+    assert.equal(await readFile(join(skillDir, 'references', 'rollback.md'), 'utf8'), '# Rollback\nsteps\n')
+    assert.match(await readFile(join(skillDir, 'SKILL.md'), 'utf8'), /body v2/)
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
