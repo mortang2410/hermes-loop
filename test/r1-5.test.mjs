@@ -56,6 +56,25 @@ async function outcomeOf(conclusion, globalDir) {
 async function exists(p) { try { await lstat(p); return true } catch { return false } }
 async function tempNames(dir) { try { return (await readdir(dir)).filter((n) => n.endsWith('.tmp')) } catch { return [] } }
 
+// Order: reference files are renamed first and SKILL.md last. A failure before the
+// SKILL.md rename then leaves SKILL.md untouched without an undo. Swapping the two
+// keeps the rollback scenarios below green, so the order is pinned here by recording
+// every rename target in the order the writer makes them.
+test('R1-5 order: reference files are renamed before SKILL.md', async () => {
+  const { globalDir } = await seed()
+  const order = []
+  const out = await withRenameHook(
+    async (to) => { order.push(basename(to)) },
+    () => outcomeOf(patch([
+      { path: 'references/a-new.md', content: 'A\n' },
+      { path: 'references/setup.md', content: 'v2\n', baseHash: sha256('v1\n') },
+    ], PATCH_BODY_B), globalDir),
+  )
+  assert.equal(out.thrown, undefined, `applyConclusion threw: ${out.thrown && out.thrown.message}`)
+  assert.equal(out.value.result, 'patched')
+  assert.deepEqual(order, ['a-new.md', 'setup.md', 'SKILL.md'], 'renames must run reference files first and SKILL.md last')
+})
+
 // Scenario A: two new reference files. The second file's rename fails with a real
 // EISDIR, induced by making its target path a directory after planning and before
 // the rename. The first file has already been written by then.
