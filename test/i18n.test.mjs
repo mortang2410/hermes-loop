@@ -403,6 +403,48 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Layout: topic skills and reference files', 'Memory', 'Division of labour', 'Output protocol'],
     'the en review protocol lost or reordered a section',
   )
+  // Position of the layout block, memory on and off, in both languages. The
+  // section pin above covers memory on only, and the parity test removes the block
+  // wherever it sits, so this pins where it is. The block starts right after the
+  // naming section (its heading, two lines and a blank line) and runs for its
+  // length; memory on then has a blank line and the memory heading, memory off
+  // goes straight to the division-of-labour heading.
+  const layoutHeading = { zh: '## 布局：topic skill 与 reference 文件', en: '## Layout: topic skills and reference files' }
+  const namingHeading = { zh: '## 命名纪律', en: '## Naming discipline' }
+  const afterBlock = { zh: { on: ['', '## 记忆'], off: ['## 分工'] }, en: { on: ['', '## Memory'], off: ['## Division of labour'] } }
+  const sectionNames = { zh: (l) => l.slice(3).replace(/（[^）]*）/g, ''), en: (l) => l.slice(3).replace(/\s*\([^)]*\)/g, '') }
+  for (const memoryOn of [true, false]) {
+    for (const lang of ['zh', 'en']) {
+      const lines = I.REVIEW_PROMPT_TEXT[lang](memoryOn)
+      const block = I.REVIEW_LAYOUT_TEXT[lang]
+      const start = lines.indexOf(layoutHeading[lang])
+      assert.notEqual(start, -1, `${lang}, memoryOn=${memoryOn}: the layout heading is missing`)
+      assert.equal(start, lines.indexOf(namingHeading[lang]) + 4,
+        `${lang}, memoryOn=${memoryOn}: the layout block must follow the naming section directly`)
+      assert.deepEqual(lines.slice(start, start + block.length), block,
+        `${lang}, memoryOn=${memoryOn}: the layout block is not where the protocol puts it`)
+      const end = start + block.length
+      const expected = afterBlock[lang][memoryOn ? 'on' : 'off']
+      const actual = lines.slice(end, end + expected.length)
+      // A heading is matched by its prefix, since the memory heading carries a parenthetical.
+      expected.forEach((want, i) => assert.ok(
+        want === '' ? actual[i] === '' : actual[i]?.startsWith(want),
+        `${lang}, memoryOn=${memoryOn}: line after the layout block ${i} is ${JSON.stringify(actual[i])}, expected ${JSON.stringify(want)}`,
+      ))
+    }
+  }
+  // Section order with memory off, in both languages. The memory-on order is
+  // pinned above; the memory-off order had no pin.
+  assert.deepEqual(
+    I.REVIEW_PROMPT_TEXT.zh(false).filter((l) => l.startsWith('## ')).map(sectionNames.zh),
+    ['主动倾向', '正向信号', '负面清单', '优先序', '命名纪律', '布局：topic skill 与 reference 文件', '分工', '输出协议'],
+    'the zh memory-off review protocol lost or reordered a section',
+  )
+  assert.deepEqual(
+    I.REVIEW_PROMPT_TEXT.en(false).filter((l) => l.startsWith('## ')).map(sectionNames.en),
+    ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Layout: topic skills and reference files', 'Division of labour', 'Output protocol'],
+    'the en memory-off review protocol lost or reordered a section',
+  )
   // Every dictionary the call sites index must carry both languages.
   for (const [name, dict] of Object.entries({ MEMORY_CONTEXT_TEXT: I.MEMORY_CONTEXT_TEXT, REVIEW_MEMORY_BLOCK_TEXT: I.REVIEW_MEMORY_BLOCK_TEXT, REVIEW_INPUT_TEXT: I.REVIEW_INPUT_TEXT })) {
     assert.deepEqual(Object.keys(dict.zh).sort(), Object.keys(dict.en).sort(), `${name}: zh/en keys differ`)
@@ -872,4 +914,25 @@ test('the memory block drops its section when both stores are off, in both langu
   assert.ok(!I.reviewPrompt(off, 'en').includes('"memory"'))
   assert.ok(!I.reviewPrompt(off, 'zh').includes('"memory"'))
   assert.match(I.reviewPrompt(off, 'en'), /not distilled this round/)
+})
+
+test('the zh review layout block is pinned to a test-owned literal', () => {
+  // The parity test removes this block from the zh prompt by reading the constant
+  // itself (stripLayout), so a changed character in the block passes it. This
+  // literal is the pin: a copy typed here, not imported from src. The two
+  // interpolated values are 8 reference files and 32768 characters per file, the
+  // values REFERENCE_FILES_MAX and REFERENCE_FILE_MAX_CHARS hold today.
+  assert.deepEqual(I.REVIEW_LAYOUT_TEXT.zh, [
+    '## 布局：topic skill 与 reference 文件',
+    '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
+    '- 经验是某个既有 topic skill 的子主题（一个具体流程、工具用法、踩坑集）→ 写入该 skill 的 references/<kebab-name>.md（放入 files 字段），并在 SKILL.md 正文里加一行指向它；',
+    '- 只改 topic skill 的概述、适用范围或触发条件 → 只改 SKILL.md 正文；',
+    '- 确实是新的宽主题，且没有任何既有 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
+    '- files 最多 8 个，每个不超过 32768 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时把注入的 baseHash 原样带回；新建文件省略 baseHash；只能修改已注入全文的文件。',
+    '输出 JSON 中可选的 files 字段（create 或 patch 均可）：',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<注入的 reference baseHash 原样带回；新建文件省略>" }]',
+  ], 'the zh layout block changed; update this literal only after checking the router facts it states')
+  // The routing facts the block states: the router reads the first 400 characters
+  // of a description, and reference files are never indexed.
+  assert.match(I.REVIEW_LAYOUT_TEXT.zh[1], /前 400 个字符.*从不被索引/)
 })
