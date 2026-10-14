@@ -644,8 +644,11 @@ test('write outcomes echo a plugin-notice user/message into the source session',
     await new Promise((r) => setTimeout(r, 100))
     assert.equal(notices.length, 1)
     assert.equal(notices[0].type, 'user/message')
-    assert.equal(notices[0].data.source.kind, 'plugin')
-    assert.equal(notices[0].data.source.plugin, 'hermes-loop')
+    // The host admits a source whose kind is a non-empty string other than the bare 'plugin'
+    // (session-format-v3-to-v4 message-sources.ts), so this notice must name its producer.
+    assert.notEqual(notices[0].data.source.kind, 'plugin', "the bare 'plugin' kind is refused by the host")
+    assert.equal(notices[0].data.source.kind, 'plugin:@local/hermes-loop-i18n')
+    assert.equal('plugin' in notices[0].data.source, false, 'the retired V3 plugin field must not ride along')
     assert.equal(notices[0].data.source.form, 'notice')
     assert.match(notices[0].data.source.summary, /echo-skill/)
     assert.match(notices[0].data.source.summary, /值得存/)
