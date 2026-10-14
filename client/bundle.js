@@ -289,7 +289,7 @@ window.__ModuleLoader__.load({
           var alive = true
           setData(null)
           setFailed(null)
-          fetch('/hermes-loop/api/skill?name=' + encodeURIComponent(props.name))
+          fetch('/api/hermes-loop/skill?name=' + encodeURIComponent(props.name))
             .then(function (r) {
               return r.json().then(function (d) { return { ok: r.ok === true, body: d } })
             })

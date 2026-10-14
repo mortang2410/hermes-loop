@@ -524,7 +524,7 @@ test('GET /status never blocks on a slow skills.snapshot (panel opens instantly)
   }
 })
 
-test('GET /hermes-loop/api/skill serves SKILL.md content from snapshot dirs and the global fallback', async () => {
+test('GET /api/hermes-loop/skill serves SKILL.md content from snapshot dirs and the global fallback', async () => {
   // 面板「查看」按钮的数据源：① invocableCache 目录投影（含项目级技能）
   // ② 全局库直读。坏名字 400、两处都读不到 404。
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-skillview-'))
@@ -555,12 +555,12 @@ test('GET /hermes-loop/api/skill serves SKILL.md content from snapshot dirs and 
     await new Promise((r) => setTimeout(r, 30))
     const route = t.routes[0]
     // 先打一次 /status 触发后台快照刷新，等它落地（single-flight，30ms 足够）
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, fakeRes())
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status?sessionId=' }, fakeRes())
     await new Promise((r) => setTimeout(r, 50))
 
     // ① 快照投影：项目级技能也能看
     const projRes = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=proj-skill' }, projRes)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/skill?name=proj-skill' }, projRes)
     assert.equal(projRes.statusCode, 200)
     const proj = JSON.parse(projRes.body)
     assert.equal(proj.name, 'proj-skill')
@@ -570,7 +570,7 @@ test('GET /hermes-loop/api/skill serves SKILL.md content from snapshot dirs and 
 
     // ② 全局库回退：不在快照里的技能直读全局库
     const globalRes = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=panel-skill' }, globalRes)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/skill?name=panel-skill' }, globalRes)
     assert.equal(globalRes.statusCode, 200)
     const globalBody = JSON.parse(globalRes.body)
     assert.equal(globalBody.description, 'global library skill')
@@ -578,18 +578,18 @@ test('GET /hermes-loop/api/skill serves SKILL.md content from snapshot dirs and 
 
     // 单文件型 resourceBase 不投影，全局库也没有 → 404（错误进弹窗）
     const fileRes = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=file-skill' }, fileRes)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/skill?name=file-skill' }, fileRes)
     assert.equal(fileRes.statusCode, 404)
 
     // 缺失技能 404；坏名字（路径逃逸载体）400；缺名字 400
     const missing = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=ghost-skill' }, missing)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/skill?name=ghost-skill' }, missing)
     assert.equal(missing.statusCode, 404)
     const escape = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill?name=..%2Fescape' }, escape)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/skill?name=..%2Fescape' }, escape)
     assert.equal(escape.statusCode, 400)
     const noName = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/skill' }, noName)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/skill' }, noName)
     assert.equal(noName.statusCode, 400)
     await rm(projDir, { recursive: true, force: true })
   } finally {
@@ -2233,7 +2233,7 @@ test('GET status 聚合工作区库：slug/cwd/chars/entries/items 齐备', asyn
   try {
     const route = t.routes[0]
     const res = fakeRes()
-    await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
+    await route.handler({ method: 'GET', url: '/api/hermes-loop/status' }, res)
     const body = JSON.parse(res.body)
     assert.ok(Array.isArray(body.memory.workspaces), 'status carries the workspaces array')
     assert.equal(body.memory.workspaces.length, 1)

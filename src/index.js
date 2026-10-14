@@ -2580,7 +2580,7 @@ module.exports = {
               }
               // 技能内容查看（面板「查看」按钮）：?name= 只接受 kebab-case——全局库
               // 回退按名字拼路径，先挡掉路径逃逸。不存在回 404，弹窗原地展示错误。
-              if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/skill')) {
+              if (req.method === 'GET' && apiPath.endsWith('/api/hermes-loop/skill')) {
                 const name = url.searchParams.get('name') || ''
                 if (!KEbab_NAME_RE.test(name)) { sendJson(res, 400, { error: 'query must provide a kebab-case skill name' }); return }
                 const skill = await readSkillForPanel(name)
