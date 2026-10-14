@@ -934,7 +934,8 @@ test('signal: correction words only count real user input, not plugin notices', 
   const t = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only' }, services)
   const session = { id: 'session-sig-word', header: {}, deriveMessages: () => [] }
   // 我们自己的回显（kind=plugin）和目录注入（kind=skill-catalog）绝不算用户纠正
-  t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '这个结果不对吧' }], source: { kind: 'plugin' } } })
+  // 我们自己的回显（kind=plugin:@local/hermes-loop-i18n）和目录注入（kind=skill-catalog）绝不算用户纠正
+  t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '这个结果不对吧' }], source: { kind: 'plugin:@local/hermes-loop-i18n' } } })
   t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '不对' }], source: { kind: 'skill-catalog', entries: [] } } })
   t.fire(session, completedTurn)
   await new Promise((r) => setTimeout(r, 50))
