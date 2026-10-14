@@ -152,6 +152,17 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     assert.ok(text.endsWith(line), 'the zh prompt must end with the output-language directive')
     return text.slice(0, -line.length)
   }
+  // The reference-file layout block (REVIEW_LAYOUT_TEXT.zh, review fix m6rf) is a
+  // second declared addition, handled the same way as the directive: its exact
+  // text is removed, and it must occur exactly once. The blank line before it and
+  // the one after it collapse to a single newline, which is the spacing upstream
+  // uses where the block was absent, so the surrounding text still compares exactly.
+  const stripLayout = (text) => {
+    const span = '\n\n' + I.REVIEW_LAYOUT_TEXT.zh.join('\n') + '\n'
+    assert.equal(text.split(span).length, 2, 'the zh layout block must occur exactly once')
+    return text.replace(span, '\n')
+  }
+  const zhAsUpstream = (text) => stripLayout(stripDirective(text))
   for (const eff of [
     { memoryEnabled: true, userProfileEnabled: true },
     { memoryEnabled: true, userProfileEnabled: false },
@@ -160,11 +171,11 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     {},
   ]) {
     assert.equal(
-      stripDirective(I.reviewPrompt(eff)),
+      zhAsUpstream(I.reviewPrompt(eff)),
       upstream().reviewPrompt(eff),
       `zh output drifted from upstream for ${JSON.stringify(eff)}`,
     )
-    assert.equal(stripDirective(I.reviewPrompt(eff, 'zh')), upstream().reviewPrompt(eff))
+    assert.equal(zhAsUpstream(I.reviewPrompt(eff, 'zh')), upstream().reviewPrompt(eff))
   }
 
   // The memory snapshot is injected into every session rather than only into the
@@ -191,7 +202,19 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   }
 
   // And assert undefined explicitly means zh, so no caller needs a sentinel.
-  assert.equal(stripDirective(I.reviewPrompt({})), upstream().reviewPrompt({}))
+  assert.equal(zhAsUpstream(I.reviewPrompt({})), upstream().reviewPrompt({}))
+
+  // Position with memory on. The strip above removes the layout block wherever it
+  // sits, so a block moved before the priority section still matches upstream. The
+  // upstream comparison is left as it is; this adds the block's position in the
+  // prompt the model receives. Test 6 pins the position for both memory states.
+  const zhOn = I.reviewPrompt({ memoryEnabled: true, userProfileEnabled: true }, 'zh').split('\n')
+  const layout = I.REVIEW_LAYOUT_TEXT.zh
+  const layoutAt = zhOn.indexOf(layout[0])
+  assert.equal(layoutAt, zhOn.indexOf('## 命名纪律') + 4, 'with memory on, the zh layout block must follow the naming section')
+  assert.deepEqual(zhOn.slice(layoutAt, layoutAt + layout.length), layout, 'with memory on, the zh layout block is not where the protocol puts it')
+  assert.equal(zhOn[layoutAt + layout.length], '', 'with memory on, a blank line must separate the layout block from the memory section')
+  assert.ok(zhOn[layoutAt + layout.length + 1].startsWith('## 记忆'), 'with memory on, the memory section must follow the layout block')
 
   // The loop-aware section is injected into every session's system prompt and
   // upstream does not export it, so compare against the array it assembles —
@@ -335,7 +358,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
   // a bare field-name substring list would also pass a prompt that had lost the
   // fence, the per-field `required for` annotations, or the enums.
   for (const [text, label] of [[en, 'en'], [zh, 'zh']]) {
-    for (const field of ['"action"', '"skill"', '"description"', '"body"', '"baseHash"', '"baseDescription"', '"rationale"', '"memory"', '"store"', '"text"', '"oldText"']) {
+    for (const field of ['"action"', '"skill"', '"description"', '"body"', '"baseHash"', '"baseDescription"', '"files"', '"path"', '"rationale"', '"memory"', '"store"', '"text"', '"oldText"']) {
       assert.ok(text.includes(field), `${label}: output contract field missing: ${field}`)
     }
     assert.ok(text.includes('```json'), `${label}: the protocol must be a fenced json block`)
@@ -384,13 +407,55 @@ test('the review prompt switches wholesale and keeps its contract', () => {
   const enSections = I.REVIEW_PROMPT_TEXT.en(true).filter((l) => l.startsWith('## '))
   assert.deepEqual(
     zhSections.map((l) => l.slice(3).replace(/（[^）]*）/g, '')),
-    ['主动倾向', '正向信号', '负面清单', '优先序', '命名纪律', '记忆', '分工', '输出协议'],
+    ['主动倾向', '正向信号', '负面清单', '优先序', '命名纪律', '布局：topic skill 与 reference 文件', '记忆', '分工', '输出协议'],
     'the zh review protocol lost or reordered a section',
   )
   assert.deepEqual(
     enSections.map((l) => l.slice(3).replace(/\s*\([^)]*\)/g, '')),
-    ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Memory', 'Division of labour', 'Output protocol'],
+    ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Layout: topic skills and reference files', 'Memory', 'Division of labour', 'Output protocol'],
     'the en review protocol lost or reordered a section',
+  )
+  // Position of the layout block, memory on and off, in both languages. The
+  // section pin above covers memory on only, and the parity test removes the block
+  // wherever it sits, so this pins where it is. The block starts right after the
+  // naming section (its heading, two lines and a blank line) and runs for its
+  // length; memory on then has a blank line and the memory heading, memory off
+  // goes straight to the division-of-labour heading.
+  const layoutHeading = { zh: '## 布局：topic skill 与 reference 文件', en: '## Layout: topic skills and reference files' }
+  const namingHeading = { zh: '## 命名纪律', en: '## Naming discipline' }
+  const afterBlock = { zh: { on: ['', '## 记忆'], off: ['## 分工'] }, en: { on: ['', '## Memory'], off: ['## Division of labour'] } }
+  const sectionNames = { zh: (l) => l.slice(3).replace(/（[^）]*）/g, ''), en: (l) => l.slice(3).replace(/\s*\([^)]*\)/g, '') }
+  for (const memoryOn of [true, false]) {
+    for (const lang of ['zh', 'en']) {
+      const lines = I.REVIEW_PROMPT_TEXT[lang](memoryOn)
+      const block = I.REVIEW_LAYOUT_TEXT[lang]
+      const start = lines.indexOf(layoutHeading[lang])
+      assert.notEqual(start, -1, `${lang}, memoryOn=${memoryOn}: the layout heading is missing`)
+      assert.equal(start, lines.indexOf(namingHeading[lang]) + 4,
+        `${lang}, memoryOn=${memoryOn}: the layout block must follow the naming section directly`)
+      assert.deepEqual(lines.slice(start, start + block.length), block,
+        `${lang}, memoryOn=${memoryOn}: the layout block is not where the protocol puts it`)
+      const end = start + block.length
+      const expected = afterBlock[lang][memoryOn ? 'on' : 'off']
+      const actual = lines.slice(end, end + expected.length)
+      // A heading is matched by its prefix, since the memory heading carries a parenthetical.
+      expected.forEach((want, i) => assert.ok(
+        want === '' ? actual[i] === '' : actual[i]?.startsWith(want),
+        `${lang}, memoryOn=${memoryOn}: line after the layout block ${i} is ${JSON.stringify(actual[i])}, expected ${JSON.stringify(want)}`,
+      ))
+    }
+  }
+  // Section order with memory off, in both languages. The memory-on order is
+  // pinned above; the memory-off order had no pin.
+  assert.deepEqual(
+    I.REVIEW_PROMPT_TEXT.zh(false).filter((l) => l.startsWith('## ')).map(sectionNames.zh),
+    ['主动倾向', '正向信号', '负面清单', '优先序', '命名纪律', '布局：topic skill 与 reference 文件', '分工', '输出协议'],
+    'the zh memory-off review protocol lost or reordered a section',
+  )
+  assert.deepEqual(
+    I.REVIEW_PROMPT_TEXT.en(false).filter((l) => l.startsWith('## ')).map(sectionNames.en),
+    ['Lean toward acting', 'Positive signals', 'Negative list', 'Priority order', 'Naming discipline', 'Layout: topic skills and reference files', 'Division of labour', 'Output protocol'],
+    'the en memory-off review protocol lost or reordered a section',
   )
   // Every dictionary the call sites index must carry both languages.
   for (const [name, dict] of Object.entries({ MEMORY_CONTEXT_TEXT: I.MEMORY_CONTEXT_TEXT, REVIEW_MEMORY_BLOCK_TEXT: I.REVIEW_MEMORY_BLOCK_TEXT, REVIEW_INPUT_TEXT: I.REVIEW_INPUT_TEXT })) {
@@ -426,6 +491,10 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     transcriptTruncated: '…(earlier messages dropped; tail kept)',
     emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
+    references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
+    referenceListed: 'listed only, full text not injected, cannot be edited this round',
+    referenceUnreadable: 'cannot be read, full text not injected, cannot be edited this round',
+    tooLarge: 'too large to patch this round: full text and baseHash not shown',
   }, 'the English review input copy changed')
   // The directives are pinned verbatim, for the same reason as every other
   // model-facing string here: `prompt.includes(directive)` reads the very
@@ -482,6 +551,15 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
     "If the name only makes sense for today's task, it is wrong — go back to priority 1/2 and extend an existing skill instead.",
     '',
+    '## Layout: topic skills and reference files',
+    "The skill router indexes only the name and the first 400 characters of each skill's description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.",
+    '- A finding is a sub-topic of an existing topic skill (one concrete procedure, tool usage, or pitfall set) → write it to references/<kebab-name>.md of that skill (in the files field), and add one line to the SKILL.md body that points to it;',
+    "- A change to the topic skill's overview, scope, or trigger conditions → edit the SKILL.md body only;",
+    '- A genuinely new broad topic that no existing skill can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
+    '- files holds at most 8 entries, each at most 32768 characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, echo its injected baseHash; omit baseHash for a new file; edit only files whose full text was injected.',
+    'The optional files field of the output JSON, for create or patch:',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<echo the injected reference baseHash; omit for a new file>" }]',
+    '',
     '## Memory (optional conclusion — most reviews should produce none)',
     'Besides skills, consider writing memory only when the conversation **explicitly** surfaced:',
     '- user profile, preferences, expectations about how you behave → store="user";',
@@ -516,14 +594,25 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     I.REVIEW_LANGUAGE_DIRECTIVE.en,
   ], 'the English review prompt changed')
   const enOff = I.REVIEW_PROMPT_TEXT.en(false)
-  assert.equal(enOff.length, 44, 'the English memory-off prompt must drop exactly the two memory blocks')
+  assert.equal(enOff.length, 53, 'the English memory-off prompt must drop exactly the two memory blocks')
   assert.ok(!enOff.some((l) => l.startsWith('## Memory')), 'no memory guidance section when memory is off')
   assert.ok(!enOff.some((l) => l.includes('"memory":')), 'no memory conclusion schema when memory is off')
   assert.deepEqual(
-    enOff.slice(26, 29),
+    enOff.slice(35, 38),
     ['## Division of labour', 'Processes, steps, pitfalls → skill. User profile/preference information is not distilled this round.', ''],
     'the English memory-off division-of-labour line must say memory is not distilled',
   )
+})
+
+test('the review prompt teaches the topic-skill / reference split in both languages', () => {
+  const eff = { memoryEnabled: true, userProfileEnabled: true }
+  const en = I.reviewPrompt(eff, 'en')
+  const zh = I.reviewPrompt(eff, 'zh')
+  for (const [text, label] of [[en, 'en'], [zh, 'zh']]) {
+    assert.ok(text.includes('references/<kebab-name>.md'), `${label}: the reference path rule is missing`)
+    assert.ok(text.includes('400'), `${label}: the router's 400-character indexing limit is missing`)
+  }
+  assert.match(en, /only the name and the first 400 characters/)
 })
 
 test('each review prompt pins the artifact language to its own language', () => {
@@ -837,4 +926,25 @@ test('the memory block drops its section when both stores are off, in both langu
   assert.ok(!I.reviewPrompt(off, 'en').includes('"memory"'))
   assert.ok(!I.reviewPrompt(off, 'zh').includes('"memory"'))
   assert.match(I.reviewPrompt(off, 'en'), /not distilled this round/)
+})
+
+test('the zh review layout block is pinned to a test-owned literal', () => {
+  // The parity test removes this block from the zh prompt by reading the constant
+  // itself (stripLayout), so a changed character in the block passes it. This
+  // literal is the pin: a copy typed here, not imported from src. The two
+  // interpolated values are 8 reference files and 32768 characters per file, the
+  // values REFERENCE_FILES_MAX and REFERENCE_FILE_MAX_CHARS hold today.
+  assert.deepEqual(I.REVIEW_LAYOUT_TEXT.zh, [
+    '## 布局：topic skill 与 reference 文件',
+    '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
+    '- 经验是某个既有 topic skill 的子主题（一个具体流程、工具用法、踩坑集）→ 写入该 skill 的 references/<kebab-name>.md（放入 files 字段），并在 SKILL.md 正文里加一行指向它；',
+    '- 只改 topic skill 的概述、适用范围或触发条件 → 只改 SKILL.md 正文；',
+    '- 确实是新的宽主题，且没有任何既有 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
+    '- files 最多 8 个，每个不超过 32768 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时把注入的 baseHash 原样带回；新建文件省略 baseHash；只能修改已注入全文的文件。',
+    '输出 JSON 中可选的 files 字段（create 或 patch 均可）：',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<注入的 reference baseHash 原样带回；新建文件省略>" }]',
+  ], 'the zh layout block changed; update this literal only after checking the router facts it states')
+  // The routing facts the block states: the router reads the first 400 characters
+  // of a description, and reference files are never indexed.
+  assert.match(I.REVIEW_LAYOUT_TEXT.zh[1], /前 400 个字符.*从不被索引/)
 })
