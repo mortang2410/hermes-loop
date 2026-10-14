@@ -646,7 +646,6 @@ test('write outcomes echo a plugin-notice user/message into the source session',
     assert.equal(notices[0].type, 'user/message')
     // The host admits a source whose kind is a non-empty string other than the bare 'plugin'
     // (session-format-v3-to-v4 message-sources.ts), so this notice must name its producer.
-    assert.notEqual(notices[0].data.source.kind, 'plugin', "the bare 'plugin' kind is refused by the host")
     assert.equal(notices[0].data.source.kind, 'plugin:@local/hermes-loop-i18n')
     assert.equal('plugin' in notices[0].data.source, false, 'the retired V3 plugin field must not ride along')
     assert.equal(notices[0].data.source.form, 'notice')
@@ -1055,8 +1054,8 @@ test('signal: correction words only count real user input, not plugin notices', 
   const { services, counter } = countingServices()
   const t = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only' }, services)
   const session = { id: 'session-sig-word', header: {}, deriveMessages: () => [] }
-  // 我们自己的回显（kind=plugin）和目录注入（kind=skill-catalog）绝不算用户纠正
-  t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '这个结果不对吧' }], source: { kind: 'plugin' } } })
+  // 我们自己的回显（kind=plugin:@local/hermes-loop-i18n）和目录注入（kind=skill-catalog）绝不算用户纠正
+  t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '这个结果不对吧' }], source: { kind: 'plugin:@local/hermes-loop-i18n' } } })
   t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '不对' }], source: { kind: 'skill-catalog', entries: [] } } })
   t.fire(session, completedTurn)
   await new Promise((r) => setTimeout(r, 50))
