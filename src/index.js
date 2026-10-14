@@ -1515,7 +1515,7 @@ module.exports = {
       try {
         session.append('user/message', {
           content: [{ type: 'text', text: summary }],
-          source: { kind: 'plugin', plugin: 'hermes-loop', form: 'notice', summary },
+          source: { kind: 'plugin:@local/hermes-loop-i18n', form: 'notice', summary },
         })
       } catch (e) { ctx.logger.warn(`hermes-loop: source-session notice: ${e && e.message}`) }
     }
