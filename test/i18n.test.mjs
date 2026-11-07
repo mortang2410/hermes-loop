@@ -134,50 +134,15 @@ function upstreamLoopAware() {
   return [...body.matchAll(/^\s*'((?:[^'\\]|\\.)*)',?\s*$/gm)].map((m) => m[1].replace(/\\(['"\\])/g, '$1'))
 }
 
-test('the default language is upstream 0.1.16, verified by running upstream', oracle, () => {
-  // The load-bearing assertion: with no preference recorded, this change must
-  // produce what the package it replaces produced. Comparing against upstream's
-  // own function catches any drift in the zh branch itself.
+test('the shared surfaces stay upstream 0.1.16, verified by running upstream', oracle, () => {
+  // The review prompt is deliberately NOT compared with upstream any more: j53y
+  // replaces the catalog and injected skill bodies with the skill router's
+  // suggestion block, which rewrites both language variants end to end. The new
+  // prompt is pinned in its own test below, and the deferral arms are pinned in
+  // test/review-router.test.mjs. What must still match the package this replaces
+  // is every surface a user who never touches Settings → Language sees, plus the
+  // one zh input string that survived the rewrite.
   //
-  // The zh branch is deliberately NOT byte-identical any more. It carries one
-  // added line, the output-language directive, because a review whose protocol
-  // was Chinese still wrote a Chinese skill for a user whose preference is `en`:
-  // the protocol's language does not pin the artifact's language, so the zh
-  // default needs the same explicit instruction the en branch has. Stripping
-  // exactly that line before comparing keeps the assertion as strong as it was:
-  // every other character is still required to match upstream exactly, so any
-  // real drift still fails here.
-  const stripDirective = (text) => {
-    const line = '\n' + I.REVIEW_LANGUAGE_DIRECTIVE.zh
-    assert.ok(text.endsWith(line), 'the zh prompt must end with the output-language directive')
-    return text.slice(0, -line.length)
-  }
-  // The reference-file layout block (REVIEW_LAYOUT_TEXT.zh, review fix m6rf) is a
-  // second declared addition, handled the same way as the directive: its exact
-  // text is removed, and it must occur exactly once. The blank line before it and
-  // the one after it collapse to a single newline, which is the spacing upstream
-  // uses where the block was absent, so the surrounding text still compares exactly.
-  const stripLayout = (text) => {
-    const span = '\n\n' + I.REVIEW_LAYOUT_TEXT.zh.join('\n') + '\n'
-    assert.equal(text.split(span).length, 2, 'the zh layout block must occur exactly once')
-    return text.replace(span, '\n')
-  }
-  const zhAsUpstream = (text) => stripLayout(stripDirective(text))
-  for (const eff of [
-    { memoryEnabled: true, userProfileEnabled: true },
-    { memoryEnabled: true, userProfileEnabled: false },
-    { memoryEnabled: false, userProfileEnabled: true },
-    { memoryEnabled: false, userProfileEnabled: false },
-    {},
-  ]) {
-    assert.equal(
-      zhAsUpstream(I.reviewPrompt(eff)),
-      upstream().reviewPrompt(eff),
-      `zh output drifted from upstream for ${JSON.stringify(eff)}`,
-    )
-    assert.equal(zhAsUpstream(I.reviewPrompt(eff, 'zh')), upstream().reviewPrompt(eff))
-  }
-
   // The memory snapshot is injected into every session rather than only into the
   // review agent, so parity is checked over every branch renderMemoryContext has:
   // both stores, one store, an enabled-but-empty store, both empty, and the
@@ -201,13 +166,9 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     assert.equal(I.renderMemoryContext(eff, readRaw, 'zh'), upstream().renderMemoryContext(eff, readRaw))
   }
 
-  // And assert undefined explicitly means zh, so no caller needs a sentinel.
-  assert.equal(zhAsUpstream(I.reviewPrompt({})), upstream().reviewPrompt({}))
-
-  // Position with memory on. The strip above removes the layout block wherever it
-  // sits, so a block moved before the priority section still matches upstream. The
-  // upstream comparison is left as it is; this adds the block's position in the
-  // prompt the model receives. Test 6 pins the position for both memory states.
+  // Position with memory on: the layout block must sit where the protocol puts
+  // it, between the naming section and the memory section. Test 6 pins the
+  // position for both memory states.
   const zhOn = I.reviewPrompt({ memoryEnabled: true, userProfileEnabled: true }, 'zh').split('\n')
   const layout = I.REVIEW_LAYOUT_TEXT.zh
   const layoutAt = zhOn.indexOf(layout[0])
@@ -226,14 +187,11 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   // upstream site that uses it, so a wrong one-character value cannot pass.
   const inUpstream = (actual, anchor, what) =>
     assert.equal(actual, upstreamLiteral(anchor, what), `not the text of the version under test — ${what}`)
-  inUpstream(I.REVIEW_INPUT_TEXT.zh.emptyCatalog, '（当前无可用 skill）', 'empty-catalog fallback')
-  inUpstream(I.REVIEW_INPUT_TEXT.zh.truncated, '…（截断）', 'suspect truncation marker')
+  inUpstream(I.REVIEW_INPUT_TEXT.zh.truncated, '…（截断）', 'patch truncation marker')
   inUpstream(I.MEMORY_CONTEXT_TEXT.zh.heading, '# 长期记忆（跨会话持久', 'memory snapshot heading')
   inUpstream(I.MEMORY_CONTEXT_TEXT.zh.userTitle, 'USER（用户画像/偏好）', 'user store title')
   inUpstream(I.MEMORY_CONTEXT_TEXT.zh.memoryTitle, 'MEMORY（环境/项目事实/约定/教训）', 'memory store title')
   inUpstream(`\n## ${I.REVIEW_MEMORY_BLOCK_TEXT.zh.section}\n`, '## 当前记忆条目（oldText', 'review memory block heading')
-  inUpstream(`\n## ${I.REVIEW_INPUT_TEXT.zh.catalog}\n`, '## 既有 skill 清单（name: description）', 'catalog heading')
-  inUpstream(`\n## ${I.REVIEW_INPUT_TEXT.zh.suspects}\n`, '## 疑似相关 skill 全文', 'suspects heading')
   inUpstream(`\n## ${I.REVIEW_INPUT_TEXT.zh.transcript}\n`, '## 会话转写（保尾截断）', 'transcript heading')
 
   // The short separators are written inline by upstream's templates rather than
@@ -484,17 +442,12 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     empty: '(empty)',
   }, 'the English review memory block copy changed')
   assert.deepEqual(I.REVIEW_INPUT_TEXT.en, {
-    catalog: 'Existing skill catalog (name: description)',
-    suspects: 'Full text of likely-relevant skills',
+    suggestions: 'Skill suggestions for this session (chosen by the skill router; one line per skill with its name, description, and the path to read when the catalog supplies one)',
+    noSuggestions: '(the router suggested no skills this round; only the memory channel is reviewed)',
     transcript: 'Session transcript (tail-preserving truncation)',
     reasoning: '(reasoning)',
     transcriptTruncated: '…(earlier messages dropped; tail kept)',
-    emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
-    references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
-    referenceListed: 'listed only, full text not injected, cannot be edited this round',
-    referenceUnreadable: 'cannot be read, full text not injected, cannot be edited this round',
-    tooLarge: 'too large to patch this round: full text and baseHash not shown',
   }, 'the English review input copy changed')
   // The directives are pinned verbatim, for the same reason as every other
   // model-facing string here: `prompt.includes(directive)` reads the very
@@ -504,8 +457,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
   // of it into a failure. The zh side is pinned here too rather than against
   // upstream, because upstream has no such line to compare against.
   assert.deepEqual(I.REVIEW_LANGUAGE_DIRECTIVE, {
-    zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写、技能目录或记忆条目本身用什么语言无关。',
-    en: "Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user's language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.",
+    zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写或记忆条目本身用什么语言无关。',
+    en: "Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user's language setting and is independent of whatever language the transcript or memory entries happen to use.",
   }, 'an output-language directive changed wording; update the pin only if the new wording still names its language and stays independent of the surrounding context')
   assert.deepEqual(I.LOOP_AWARE_TEXT.en, [
     '# Wrap-up distillation (the background learning loop is running)',
@@ -533,7 +486,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '1. The user corrected style/tone/format/verbosity ("stop doing X" / "too verbose" / "just give me the answer") — this is a FIRST-CLASS signal;',
     '2. The user corrected the workflow or the order of steps;',
     '3. A non-trivial technique, fix, workaround, debugging path, or tool usage appeared;',
-    '4. An injected existing skill was found wrong, incomplete, or outdated → PATCH it immediately.',
+    '4. An existing skill listed in the suggestion block was found wrong, incomplete, or outdated → name it in the rationale; this round cannot edit it.',
     '',
     '## Negative list (never distill these)',
     '- Environment dependency failures (missing binary, unconfigured credentials — things the user can fix themselves);',
@@ -543,22 +496,24 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
     '',
     '## Priority order',
-    '1. PATCH a skill that appeared in the transcript and whose full text was injected;',
-    '2. PATCH an existing class-level umbrella skill (see the catalog below);',
+    'The suggestion block is the only skill list this round; to change a skill you read its file, which returns the text and its SHA-256.',
+    '1. A skill in the suggestion block already covers the finding: it cannot be patched this round (no read tool, so no baseHash), so name it in the rationale and answer nothing;',
+    '2. A class-level umbrella skill outside the block covers it: name it in the rationale too; do not patch;',
     '3. Only when neither covers it, CREATE a new skill.',
     '',
     '## Naming discipline',
     'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
-    "If the name only makes sense for today's task, it is wrong — go back to priority 1/2 and extend an existing skill instead.",
+    'If the name only makes sense for today\'s task, it is wrong — go back to priority 1/2 and extend an existing skill instead.',
     '',
     '## Layout: topic skills and reference files',
-    "The skill router indexes only the name and the first 400 characters of each skill's description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.",
+    'The skill router indexes only the name and the first 400 characters of each skill\'s description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.',
     '- A finding is a sub-topic of an existing topic skill (one concrete procedure, tool usage, or pitfall set) → write it to references/<kebab-name>.md of that skill (in the files field), and add one line to the SKILL.md body that points to it;',
-    "- A change to the topic skill's overview, scope, or trigger conditions → edit the SKILL.md body only;",
-    '- A genuinely new broad topic that no existing skill can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
-    '- files holds at most 8 entries, each at most 32768 characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, echo its injected baseHash; omit baseHash for a new file; edit only files whose full text was injected.',
+    '- A change to the topic skill\'s overview, scope, or trigger conditions → edit the SKILL.md body only;',
+    '- A genuinely new broad topic that no skill in the suggestion block can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
+    '- files holds at most 8 entries, each at most 32768 characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, use the SHA-256 the read tool returned for it as its baseHash; omit baseHash for a new file.',
+    '- This round has no read tool (a later change adds it), so no existing skill and no existing reference file can be edited: this round only CREATEs, and files may only carry new files.',
     'The optional files field of the output JSON, for create or patch:',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<echo the injected reference baseHash; omit for a new file>" }]',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<the SHA-256 returned when you read the file; omit for a new file>" }]',
     '',
     '## Memory (optional conclusion — most reviews should produce none)',
     'Besides skills, consider writing memory only when the conversation **explicitly** surfaced:',
@@ -578,8 +533,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '  "skill": "kebab-case-name",            // required for create/patch',
     '  "description": "≤500 characters",       // required for create',
     '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
-    '  "baseHash": "<echo the injected suspect baseHash verbatim>",  // required for patch',
-    '  "baseDescription": "<echo the injected suspect description verbatim>",  // required for patch',
+    '  "baseHash": "<SHA-256 of the SKILL.md text you read>",  // required for patch',
+    '  "baseDescription": "<the description field of the SKILL.md you read>",  // required for patch',
     '  "rationale": "One sentence: why it is worth storing, or why not",',
     '  "memory": {                            // optional; most reviews should omit the whole field',
     '    "action": "nothing" | "add" | "replace" | "remove",',
@@ -589,16 +544,18 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '    "rationale": "Why record / change / delete" }',
     '}',
     '```',
-    'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
+    'On patch, the body must be derived by modifying the skill text you read (keep what is correct, change only what must change); never rewrite it from scratch. This round there is no read tool, so do not emit a patch.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
-    I.REVIEW_LANGUAGE_DIRECTIVE.en,
+    'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript or memory entries happen to use.',
   ], 'the English review prompt changed')
   const enOff = I.REVIEW_PROMPT_TEXT.en(false)
-  assert.equal(enOff.length, 53, 'the English memory-off prompt must drop exactly the two memory blocks')
+  assert.equal(enOff.length, 55, 'the English memory-off prompt must drop exactly the two memory blocks')
   assert.ok(!enOff.some((l) => l.startsWith('## Memory')), 'no memory guidance section when memory is off')
   assert.ok(!enOff.some((l) => l.includes('"memory":')), 'no memory conclusion schema when memory is off')
+  const division = enOff.indexOf('## Division of labour')
+  assert.notEqual(division, -1, 'the memory-off prompt keeps the division-of-labour section')
   assert.deepEqual(
-    enOff.slice(35, 38),
+    enOff.slice(division, division + 3),
     ['## Division of labour', 'Processes, steps, pitfalls → skill. User profile/preference information is not distilled this round.', ''],
     'the English memory-off division-of-labour line must say memory is not distilled',
   )
@@ -939,10 +896,11 @@ test('the zh review layout block is pinned to a test-owned literal', () => {
     '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
     '- 经验是某个既有 topic skill 的子主题（一个具体流程、工具用法、踩坑集）→ 写入该 skill 的 references/<kebab-name>.md（放入 files 字段），并在 SKILL.md 正文里加一行指向它；',
     '- 只改 topic skill 的概述、适用范围或触发条件 → 只改 SKILL.md 正文；',
-    '- 确实是新的宽主题，且没有任何既有 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
-    '- files 最多 8 个，每个不超过 32768 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时把注入的 baseHash 原样带回；新建文件省略 baseHash；只能修改已注入全文的文件。',
+    '- 确实是新的宽主题，且建议块里没有任何 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
+    '- files 最多 8 个，每个不超过 32768 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时，把读文件工具返回的 SHA-256 作为它的 baseHash；新建文件省略 baseHash。',
+    '- 本轮没有读文件工具（后续改动才加入），所以任何已存在的 skill 和 reference 文件都不可修改：本轮只能 CREATE 新 skill，files 里只能放新建文件。',
     '输出 JSON 中可选的 files 字段（create 或 patch 均可）：',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<注入的 reference baseHash 原样带回；新建文件省略>" }]',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<读到该文件时返回的 SHA-256；新建文件省略>" }]',
   ], 'the zh layout block changed; update this literal only after checking the router facts it states')
   // The routing facts the block states: the router reads the first 400 characters
   // of a description, and reference files are never indexed.

@@ -145,17 +145,29 @@ function createLanguageResolver({ read, schedule, retries = LANGUAGE_RETRIES }) 
   return resolve
 }
 const BODY_MAX_CHARS = 128 * 1024
-const SUSPECT_BODY_MAX_CHARS = 8 * 1024
+// The largest skill body the writer will replace with a full-file patch: a review
+// that never saw the whole file cannot rebuild it. The read tool of a later change
+// inherits this ceiling so the refusal happens at read time.
+const PATCHABLE_BODY_MAX_CHARS = 8 * 1024
 // Reference files: sub-topic notes under a skill's references/ directory. The
 // router never indexes them, so they carry detail the SKILL.md body points to.
 const REFERENCE_FILE_MAX_CHARS = 32 * 1024
 const REFERENCE_FILES_MAX = 8
-// Full text of one suspect's reference files shown to the review, in total.
-const REFERENCE_INJECT_MAX_CHARS = 32 * 1024
 const REFERENCE_PATH_RE = /^references\/[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 const REFERENCE_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 const TRANSCRIPT_MESSAGE_CAP = 40
 const TRANSCRIPT_MESSAGE_CHARS = 4000
+// The router's published service, as a literal and not an import: this plugin
+// stays a plain JS plugin with no dependency on the router package. The shape is
+// a structural contract (`query({text, recent, alreadySuggested})`), so a router
+// mounted after this plugin is found by `ctx.get` at call time.
+const SKILL_SUGGESTION_SERVICE = 'skillRouterSuggestions'
+// The suppression set a review passes. A review has no turn history, so it has
+// suggested nothing in this session; passing an empty set is the contract's own
+// answer (`NO_SUPPRESSION` in the router), not an invented piece of session state.
+const REVIEW_ALREADY_SUGGESTED = new Set()
+// A review the router cannot answer is retried an hour later, once.
+const REVIEW_RETRY_DELAY_MS = 60 * 60 * 1000
 // ── Memory 通道（design §12，v0.5）──
 const MEMORY_ENTRY_MAX_CHARS = 500
 const MEMORY_STORES = ['memory', 'user']
@@ -209,8 +221,6 @@ const DEFAULTS = {
   cooldownMinutes: 30,
   maxTranscriptChars: 12000,
   reviewTimeoutSec: 300,
-  catalogDescriptionMax: 500,
-  suspectsTopN: 3,
   maxTranscriptMessages: TRANSCRIPT_MESSAGE_CAP,
   // ── Curator（design §10，v0.3）：纳管集只含本插件 created 的技能 ──
   curatorEnabled: true,
@@ -243,8 +253,6 @@ function settingsSchema(S) {
     cooldownMinutes: S.number().min(0).default(30).volatile(),
     maxTranscriptChars: S.number().min(1000).default(12000).volatile(),
     reviewTimeoutSec: S.number().min(30).default(300).volatile(),
-    catalogDescriptionMax: S.number().min(50).default(500).volatile(),
-    suspectsTopN: S.number().min(0).max(10).default(3).volatile(),
     maxTranscriptMessages: S.number().min(5).max(400).default(40).volatile(),
     curatorEnabled: S.boolean().default(true).volatile(),
     curatorStaleDays: S.number().min(1).default(30).volatile(),
@@ -320,39 +328,81 @@ function renderTranscript(messages, { maxChars = DEFAULTS.maxTranscriptChars, ma
   return out
 }
 
-/** Keyword tokens for suspect matching: latin words ≥3 chars + CJK runs ≥2 chars. */
-function tokenize(text) {
-  const tokens = new Set()
-  for (const raw of String(text || '').toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
-    if (raw.length >= 3 && !/[\u4e00-\u9fff]/.test(raw)) tokens.add(raw)
-    else if (/^[\u4e00-\u9fff]{2,}$/.test(raw)) tokens.add(raw)
-  }
-  return tokens
+/**
+ * Resolve the router's suggestion service, at call time.
+ *
+ * Not at apply: mount order must not decide availability, so a router mounted
+ * after this plugin is still found. `ctx.get` is the optional-dependency lookup
+ * and answers `undefined` for a service this host never published; the try/catch
+ * covers a host whose lookup throws instead.
+ *
+ * @param {object} ctx Plugin context.
+ * @returns {{query: Function}|undefined}
+ */
+function suggestionServiceOf(ctx) {
+  try {
+    const service = ctx && typeof ctx.get === 'function' ? ctx.get(SKILL_SUGGESTION_SERVICE) : undefined
+    if (service === undefined || service === null || typeof service.query !== 'function') return undefined
+    return service
+  } catch { return undefined }
 }
 
 /**
- * Rank catalog entries against the transcript for full-text injection.
- * Score: full-name substring hit ≫ name-token hits ≫ description hits.
- * Returns entries with score > 0, best first.
+ * Ask the router which skills fit this session, and never throw.
+ *
+ * A review has no turn history, so there is no "last typed message" to match:
+ * the conversation the review was asked to judge is the query text, and there is
+ * no follow-up context to pass. The suppression set is empty for the same reason.
+ *
+ * Degradation is returned, not absorbed: "nothing fits" (`degraded: false` with
+ * no suggestions) lets the review run its memory channel, while "I could not
+ * tell" must stop the run. A missing service and a thrown query are degradation
+ * too, with reasons of their own, so the ledger says which one happened.
+ *
+ * @param {object} ctx Plugin context.
+ * @param {string} text The session text to match.
+ * @returns {Promise<{suggestions: object[], rendered: string, degraded: boolean, reason?: string, detail?: string}>}
  */
-function rankSuspects(catalog, transcriptText) {
-  const haystack = String(transcriptText || '').toLowerCase()
-  const scored = []
-  for (const entry of catalog) {
-    const name = String(entry.name || '')
-    const lowered = name.toLowerCase()
-    let score = 0
-    if (lowered.length >= 4 && haystack.includes(lowered)) score += 10
-    for (const token of tokenize(name)) {
-      if (haystack.includes(token)) score += 3
+async function queryReviewSuggestions(ctx, text) {
+  const service = suggestionServiceOf(ctx)
+  if (service === undefined) {
+    return {
+      suggestions: [],
+      rendered: '',
+      degraded: true,
+      reason: 'missing-service',
+      detail: `no "${SKILL_SUGGESTION_SERVICE}" service is published on this host`,
     }
-    for (const token of tokenize(entry.description)) {
-      if (haystack.includes(token)) score += 1
-    }
-    if (score > 0) scored.push({ entry, score })
   }
-  scored.sort((a, b) => b.score - a.score)
-  return scored.map((s) => s.entry)
+  let result
+  try {
+    result = await service.query({ text, recent: [], alreadySuggested: REVIEW_ALREADY_SUGGESTED })
+  } catch (error) {
+    return { suggestions: [], rendered: '', degraded: true, reason: 'query-failed', detail: errorText(error) }
+  }
+  if (result === null || typeof result !== 'object') {
+    return { suggestions: [], rendered: '', degraded: true, reason: 'query-failed', detail: 'the suggestion service answered with no result object' }
+  }
+  if (result.degraded === true) {
+    // The contract says a degraded answer carries no block; do not propagate a
+    // field that contradicts it, because the caller would then render one.
+    return {
+      suggestions: [],
+      rendered: '',
+      degraded: true,
+      reason: typeof result.reason === 'string' && result.reason !== '' ? result.reason : 'unknown',
+      detail: typeof result.detail === 'string' ? result.detail : undefined,
+    }
+  }
+  return {
+    suggestions: Array.isArray(result.suggestions) ? result.suggestions : [],
+    rendered: typeof result.rendered === 'string' ? result.rendered : '',
+    degraded: false,
+  }
+}
+
+function errorText(error) {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error)
 }
 
 /** Pull the first fenced ```json block, else the outermost braces span. */
@@ -469,232 +519,6 @@ function sha256(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
-/**
- * Read the skill catalog for a review.
- *
- * A plugin's injected `ctx.skills` resolves to the registry of the include
- * subtree that plugin row mounts in, which holds ONLY sibling runtime
- * registrations (the office skills, vision-skills) and none of the filesystem
- * provider's user skills. Measured on this host: a plugin-ctx read returns 3
- * rows while the catalog holds 400+. Reading through an agent context is what
- * returns the full set; this is the same defect the skill-router documents and
- * fixes the same way (packages/dsh-skill-router/src/index.ts, "The catalog MUST
- * be read through an agent context, not this plugin's own").
- *
- * Which agent matters, and this is the part that is easy to get wrong. Reading
- * through an agent context is necessary but NOT sufficient: `snapshot({ scope })`
- * merges the global layer plus the scope CHAIN (`dsh-skill/lib/index.js:299`,
- * `[this.layers.global, ...this.layers.chainLayers(options.scope)]`), and only an
- * agent that JOINED a preset has the preset's rows in that chain. The host links
- * the two by calling `presets.mount(agentCtx, presetId)` inside an agent's
- * `setup` (dsh-api-session-controller/lib/index.js:368,
- * dsh-webhook/lib/index.js:172). Passing `meta: { agentPreset }` records an
- * identity in the session header and performs no mount, and neither
- * `dsh-agent/lib/index.js` nor `dsh-agent-loop/lib/index.js` mentions presets at
- * all.
- *
- * So the review agent, which this plugin creates itself, carries an agent-scoped
- * context whose chain has no filesystem provider: its read is genuinely scoped,
- * genuinely `complete: true`, and returns one runtime row. The triggering
- * session's agent is the one the host composed and mounted, so it is read first.
- *
- * @param {{sessionAgent?: object, reviewAgent?: object, ctx: object}} sources
- *   The agents to try, in order, plus the plugin context for the last-resort read.
- * @param {{cwd?: string, signal?: AbortSignal}} opts Lookup options.
- * @returns {Promise<object>} The snapshot, plus `via`: which scope answered.
- */
-/** Provider name `dsh-skill` stamps on runtime registrations (`RUNTIME_PROVIDER`). */
-const RUNTIME_PROVIDER_NAME = 'runtime'
-/** Module specifier of the skill provider a preset must mount for a full catalog. */
-const REQUIRED_SKILL_PROVIDER = '@deepseek-ai/dsh-skill-filesystem'
-/** Cordis fiber state meaning "loaded and providing" (`FiberState.ACTIVE`). */
-const FIBER_ACTIVE = 2
-
-/** The skills registry a live agent's own context resolves, or undefined. */
-function skillsServiceOf(agent) {
-  try {
-    return agent && agent.ctx && typeof agent.ctx.get === 'function' ? agent.ctx.get('skills') : undefined
-  } catch { return undefined }
-}
-
-/**
- * Structurally establish whether `agent`'s scope can reach a live skill provider.
- *
- * Row labels CANNOT answer this, which is why this check exists. A catalog that
- * came back providerless and `complete: true` looks identical to a library that
- * merely holds no skills, and a provider row that is mounted but disabled still
- * answers `complete: true`. The only sound evidence is the composition itself.
- *
- * Two host APIs supply it, both public
- * (`dsh-agent-preset-registry/lib/types/index.d.ts:95`, `:126`):
- *  - `composedPreset(agent.ctx)` returns the preset an agent joined, or
- *    `undefined` when it joined none. It works by matching the agent scope's
- *    PARENT key against live standing mounts, so it is true negative evidence:
- *    an agent with no preset has no parent link at all
- *    (`dsh-agent-preset-registry/lib/index.js:147-156`).
- *  - `compositionInventory()` reports every preset's rows with `moduleName`,
- *    `enabled`, and `fiberState` (`mountedCompositionRows`, same file `:360-375`).
- *    The skill provider row must be `enabled` and `ACTIVE` (state 2,
- *    `cordis/lib/types/fiber.d.ts:70`).
- *
- * Returns a named verdict rather than a boolean, because it can prove a POSITIVE
- * and never a negative, and the caller acts on exactly that asymmetry:
- *  - `'active'`          the agent's preset carries an enabled, ACTIVE skill
- *                        provider row. A catalog read through this agent merged a
- *                        discovery provider, so the row-label arm is not consulted.
- *  - `'no-preset'`       the agent joined no preset. NOT evidence of a missing
- *                        provider: the global layer is always merged (see below).
- *  - `'provider-absent'` the joined preset names no skill provider row. Also not
- *                        evidence, for the same reason.
- *  - `'provider-inactive'` the row exists but is disabled or not ACTIVE.
- *  - `'malformed'`       the inventory answered with rows this code cannot read.
- *  - `'unprovable'`      the host exposes no preset registry.
- * Every verdict other than `'active'` means "could not establish health", which
- * sends the caller to the row-label arm rather than shorting the catalog outright.
- *
- * What this proof CANNOT establish, and must not be read as establishing: that a
- * provider returned ZERO rows. `snapshot()` reports provider names per ROW, so a
- * provider that found nothing is invisible; no public API enumerates the
- * providers behind a scoped read. A host with the only filesystem provider on the
- * GLOBAL plane (`dsh-base/cordis.patch.yml:297`, which the web bundle disables in
- * favour of presets) is the standing counterexample to treating `'no-preset'` as
- * a verdict of absence.
- *
- * KNOWN CEILING, not an oversight: the inventory reports the CURRENT definition's
- * generation (`dsh-agent-preset-registry/lib/index.js:805` reads
- * `record.generation`), while `composedPreset` names the generation the agent
- * actually joined. An agent held on an older revision of a same-id preset could
- * therefore be authenticated by the newer revision's active row. It is left
- * unfixed because a second generation for one id is not reachable on a running
- * host: `register()` rejects a duplicate id (same file `:503`), the declarative
- * preset row registers once at startup (`dsh-agent-preset/lib/index.js:24-26`),
- * live HMR is disabled in this profile (`~/.dsh/profiles/web/cordis.patch.yml:339`),
- * and `select()` refuses to rebind a session whose first turn has started
- * (`dsh-agent-preset-registry/lib/index.js:755-758`). The registry exposes no API
- * that returns the joined generation, so no sound fix exists from here; closing it
- * would need a host change.
- *
- * @param {object} ctx Plugin context, used only to reach the preset registry.
- * @param {object} agent The agent whose scope was read.
- * @returns {Promise<string>} One of the six verdicts above.
- */
-async function providerProofOf(ctx, agent) {
-  try {
-    let presets
-    try {
-      presets = ctx && typeof ctx.get === 'function' ? ctx.get('agentPresets', false) : undefined
-    } catch { return 'unprovable' }
-    if (presets === undefined || typeof presets.composedPreset !== 'function' || typeof presets.compositionInventory !== 'function') {
-      return 'unprovable'
-    }
-    let presetId
-    try { presetId = presets.composedPreset(agent && agent.ctx) } catch { return 'unprovable' }
-    if (presetId === undefined) return 'no-preset'
-    let inventory
-    try { inventory = await presets.compositionInventory() } catch { return 'unprovable' }
-    const entry = (Array.isArray(inventory) ? inventory : []).find((p) => p && p.id === presetId)
-    if (entry === undefined || !Array.isArray(entry.rows)) return 'unprovable'
-    // Row inspection defends itself: a non-conforming inventory object can expose
-    // a throwing accessor, and a proof that aborts the review is worse than one
-    // that reports it could not tell.
-    const row = entry.rows.find((r) => r && r.moduleName === REQUIRED_SKILL_PROVIDER)
-    if (row === undefined) return 'provider-absent'
-    if (row.enabled !== true) return 'provider-inactive'
-    // Exact match, not "any defined state": the host omits `fiberState` when the
-    // row has no fiber (`dsh-agent-preset-registry/lib/index.js:371`), and a row
-    // with no live fiber is not a provider that answered.
-    if (row.fiberState !== FIBER_ACTIVE) return 'provider-inactive'
-    return 'active'
-  } catch { return 'malformed' }
-}
-
-/**
- * Whether a NON-EMPTY snapshot was answered entirely by runtime registrations.
- *
- * This is the arm that catches the shipped defect, and it is evidence-based
- * rather than absence-based, which is what makes it sound: rows DID come back and
- * every one of them is a runtime registration, so no discovery provider answered
- * the scope that was read. That is a positive observation about the rows in hand,
- * not an inference from the composition being unreadable.
- *
- * Rows a runtime registration contributes are stamped `provider: 'runtime'`
- * (`dsh-skill`, `register()` sets `provider: skill.provider ?? RUNTIME_PROVIDER`;
- * the vision toolkit's `vision-skills` is registered exactly that way and carries
- * no provider field of its own). Every discovered row carries its provider's own
- * name (the filesystem provider stamps `filesystem`, the office one `dsh-office`).
- * It is deliberately NOT a row count: a library holding one skill is healthy, and
- * any threshold would call it short.
- *
- * An EMPTY snapshot is deliberately not flagged, and NOTHING here infers absence
- * from emptiness. Emptiness cannot distinguish a scope with no provider from a
- * library that genuinely holds no skills, so flagging it would make the first
- * create on a fresh install impossible. The `active` structural proof is what
- * makes an empty catalog trustworthy when a provider is known to be in scope; the
- * `via: 'plugin-ctx'` arm covers the empty read that is knowably providerless.
- *
- * KNOWN CEILING, and it is a trade the host API forces. A discovery provider that
- * answers ZERO rows leaves no row behind to stamp, so these two situations are
- * byte-identical to every public API:
- *   (a) no discovery provider was reachable at all (the shipped defect), and
- *   (b) a provider WAS reachable and the library is simply empty, while a runtime
- *       registration makes the snapshot nonempty.
- * `snapshot()` returns only `{ skills, complete }`
- * (`dsh-skill/lib/types/index.d.ts:152-157`), a zero-row provider contributes
- * zero rows, and no API enumerates the providers behind a scoped read. So (b) is
- * withheld here as if it were (a). The cost is bounded and self-healing: it
- * affects only a host whose library has no provider-backed skill at all, and the
- * arm stops firing the moment one exists. Closing it needs a host change, namely a
- * field on `SkillCatalogSnapshot` reporting which providers participated in a
- * scoped read. Withholding is the deliberate direction of this trade: a missed
- * first create is recoverable, while a create drawn from a catalog missing the
- * skill it should have matched is a silent duplicate.
- *
- * @param {object} snapshot A snapshot returned by `readCatalogFor`.
- * @returns {boolean} true when rows came back but none from a discovery provider.
- */
-function catalogLooksProviderless(snapshot) {
-  const rows = snapshot && Array.isArray(snapshot.skills) ? snapshot.skills : []
-  if (rows.length === 0) return false
-  return !rows.some((s) => s && typeof s.provider === 'string' && s.provider !== RUNTIME_PROVIDER_NAME)
-}
-
-/**
- * Whether a read's provider proof means the catalog may be trusted.
- *
- * `'active'` is positive structural proof. `'unprovable'` is NOT proof and is
- * accepted only because the alternative is refusing every skill write on a host
- * that exposes no preset registry; the caller records that it degraded.
- *
- * @param {string} proof A verdict from `providerProofOf`.
- * @returns {boolean} true when the read may be trusted on structural grounds.
- */
-function providerProofIsPositive(proof) {
-  return proof === 'active'
-}
-
-async function readCatalogFor({ sessionAgent, reviewAgent, ctx }, { cwd, signal } = {}) {
-  // The scope that is read decides which layers are merged, and only an agent
-  // that JOINED a preset carries the preset's rows in its chain. The triggering
-  // session's agent is the one the host composed (dsh-api-session-controller
-  // calls `presets.mount(agentCtx, resolvedId)` during setup), so it is the
-  // first choice; the review agent is the fallback, and it is exactly the case
-  // that fails on this host, because `meta.agentPreset` records an identity but
-  // performs no mount.
-  const sources = [
-    [sessionAgent, 'session-agent'],
-    [reviewAgent, 'review-agent'],
-  ]
-  for (const [candidate, scope] of sources) {
-    const service = skillsServiceOf(candidate)
-    if (service === undefined || typeof service.snapshot !== 'function') continue
-    const snapshot = await service.snapshot({ cwd, signal, scope: candidate })
-    const providerProof = await providerProofOf(ctx, candidate)
-    return { ...snapshot, via: 'agent-ctx', scope, providerProof }
-  }
-  const snapshot = await ctx.skills.snapshot({ cwd, signal })
-  return { ...snapshot, via: 'plugin-ctx', scope: undefined, providerProof: 'no-preset' }
-}
-
 /** Render final SKILL.md content: frontmatter (name/description) + body. */
 function buildSkillMd(name, description, body) {
   const yaml = `name: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description.replace(/\r?\n/g, ' '))}`
@@ -771,10 +595,11 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
   const description = conclusion.baseDescription !== undefined && conclusion.baseDescription !== ''
     ? conclusion.baseDescription
     : descriptionOf(current) || ''
-  // A patch is a full-file rewrite. Built from a cut view (the review shows at most
-  // SUSPECT_BODY_MAX_CHARS of a suspect, and marks a cut), it would drop the tail.
-  if (current.length > SUSPECT_BODY_MAX_CHARS) {
-    return { result: 'rejected', detail: `skill '${conclusion.skill}' is longer than ${SUSPECT_BODY_MAX_CHARS} characters; a patch built from a cut view would drop its tail` }
+  // A patch is a full-file rewrite. Built from a cut view (the reviewer's read
+  // refuses a file over this ceiling, so a body that large was never seen whole),
+  // it would drop the tail.
+  if (current.length > PATCHABLE_BODY_MAX_CHARS) {
+    return { result: 'rejected', detail: `skill '${conclusion.skill}' is longer than ${PATCHABLE_BODY_MAX_CHARS} characters; a patch built from a cut view would drop its tail` }
   }
   // The review's cut marker (both languages). A body that carries it was built from a cut view.
   const cutMarkers = [REVIEW_INPUT_TEXT.zh.truncated, REVIEW_INPUT_TEXT.en.truncated].map((m) => m.trim())
@@ -972,58 +797,6 @@ async function entryKind(path) {
   } catch (e) {
     return e && e.code === 'ENOENT' ? 'missing' : 'other'
   }
-}
-
-/**
- * The reference files a review may see: regular files directly under references/
- * with kebab-case .md names. The directory must be a real directory, or readdir
- * would follow a symlink out of the skill. Each file carries the baseHash a
- * patch must echo.
- */
-async function listReferenceFiles(skillDir) {
-  const dir = join(skillDir, 'references')
-  if ((await entryKind(dir)) !== 'dir') return []
-  let names
-  try { names = await fsP.readdir(dir) } catch { return [] }
-  const files = []
-  for (const name of names.sort()) {
-    if (!REFERENCE_NAME_RE.test(name)) continue
-    const abs = join(dir, name)
-    if ((await entryKind(abs)) !== 'file') continue
-    let content
-    try { content = await fsP.readFile(abs, 'utf8') } catch {
-      // One unreadable file must not abort the review: it is listed by name only,
-      // so the review can neither see nor patch it.
-      files.push({ path: `references/${name}`, unreadable: true })
-      continue
-    }
-    files.push({ path: `references/${name}`, content, baseHash: sha256(content) })
-  }
-  return files
-}
-
-/**
- * Review-input text for one skill's reference files. Full text, with the baseHash
- * to echo, goes to files in name order while three limits hold: at most
- * REFERENCE_FILES_MAX files, each within REFERENCE_FILE_MAX_CHARS, and the running
- * total within REFERENCE_INJECT_MAX_CHARS. Every other file is named only, because
- * the review must not patch a file whose full text it has not seen.
- */
-function renderReferenceBlock(files, lang) {
-  if (files.length === 0) return ''
-  const T = REVIEW_INPUT_TEXT[lang]
-  let shown = 0
-  let budget = REFERENCE_INJECT_MAX_CHARS
-  const parts = files.map((f) => {
-    if (f.unreadable) return `- ${f.path} (${T.referenceUnreadable})`
-    if (shown < REFERENCE_FILES_MAX && f.content.length <= REFERENCE_FILE_MAX_CHARS && f.content.length <= budget) {
-      shown += 1
-      budget -= f.content.length
-      return `#### ${f.path}\nbaseHash: ${f.baseHash}\n\n${f.content}`
-    }
-    return `- ${f.path} (${T.referenceListed})`
-  })
-  return `${T.references}\n\n${parts.join('\n\n')}`
 }
 
 function descriptionOf(skillMdContent) {
@@ -1246,30 +1019,20 @@ const LOOP_AWARE_TEXT = {
 
 const REVIEW_INPUT_TEXT = {
   zh: {
-    catalog: '既有 skill 清单（name: description）',
-    suspects: '疑似相关 skill 全文',
+    suggestions: '本会话的技能建议（skill 路由器选出；每行一个 skill，含 name、description 和可读取的路径）',
+    noSuggestions: '（路由器本轮没有建议任何 skill——本轮只复盘记忆通道）',
     transcript: '会话转写（保尾截断）',
     reasoning: '（推理中）',
     transcriptTruncated: '…（早段已按保尾策略截断）',
-    emptyCatalog: '（当前无可用 skill）',
     truncated: '\n…（截断）',
-    references: '该 skill 的 reference 文件（references/*.md；patch 时把每个文件的 baseHash 原样带回）',
-    referenceListed: '仅列出，未注入全文，本轮不可修改',
-    referenceUnreadable: '无法读取，未注入全文，本轮不可修改',
-    tooLarge: '正文超过长度上限，本轮不可修改（未注入全文，也没有 baseHash）',
   },
   en: {
-    catalog: 'Existing skill catalog (name: description)',
-    suspects: 'Full text of likely-relevant skills',
+    suggestions: 'Skill suggestions for this session (chosen by the skill router; one line per skill with its name, description, and the path to read when the catalog supplies one)',
+    noSuggestions: '(the router suggested no skills this round; only the memory channel is reviewed)',
     transcript: 'Session transcript (tail-preserving truncation)',
     reasoning: '(reasoning)',
     transcriptTruncated: '…(earlier messages dropped; tail kept)',
-    emptyCatalog: '(no skills available)',
     truncated: '\n… (truncated)',
-    references: 'Reference files of this skill (references/*.md; echo each baseHash to patch that file)',
-    referenceListed: 'listed only, full text not injected, cannot be edited this round',
-    referenceUnreadable: 'cannot be read, full text not injected, cannot be edited this round',
-    tooLarge: 'too large to patch this round: full text and baseHash not shown',
   },
 }
 
@@ -1322,8 +1085,6 @@ function sanitizeSettingsPatch(patch) {
   num('cooldownMinutes', 0)
   num('maxTranscriptChars', 1000)
   num('reviewTimeoutSec', 30)
-  num('catalogDescriptionMax', 50)
-  num('suspectsTopN', 0, 10)
   num('maxTranscriptMessages', 5, 400)
   if (typeof patch.curatorEnabled === 'boolean') out.curatorEnabled = patch.curatorEnabled
   num('curatorStaleDays', 1)
@@ -1398,8 +1159,8 @@ function curatorTransitions(records, usage, { now, staleDays, archiveDays }) {
 // 用哪种语言。写明「与转写/目录/记忆的语言无关」是因为漂移源正是它们的语言。
 // 这两个串是 zh 分支相对上游 0.1.16 唯一的增量，parity 测试按「上游 + 本行」比对。
 const REVIEW_LANGUAGE_DIRECTIVE = {
-  zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写、技能目录或记忆条目本身用什么语言无关。',
-  en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.',
+  zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写或记忆条目本身用什么语言无关。',
+  en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript or memory entries happen to use.',
 }
 /**
  * Layout rules for topic skills and reference files, shared by the review prompt
@@ -1413,20 +1174,22 @@ const REVIEW_LAYOUT_TEXT = {
     '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
     '- 经验是某个既有 topic skill 的子主题（一个具体流程、工具用法、踩坑集）→ 写入该 skill 的 references/<kebab-name>.md（放入 files 字段），并在 SKILL.md 正文里加一行指向它；',
     '- 只改 topic skill 的概述、适用范围或触发条件 → 只改 SKILL.md 正文；',
-    '- 确实是新的宽主题，且没有任何既有 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
-    `- files 最多 ${REFERENCE_FILES_MAX} 个，每个不超过 ${REFERENCE_FILE_MAX_CHARS} 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时把注入的 baseHash 原样带回；新建文件省略 baseHash；只能修改已注入全文的文件。`,
+    '- 确实是新的宽主题，且建议块里没有任何 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
+    `- files 最多 ${REFERENCE_FILES_MAX} 个，每个不超过 ${REFERENCE_FILE_MAX_CHARS} 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时，把读文件工具返回的 SHA-256 作为它的 baseHash；新建文件省略 baseHash。`,
+    '- 本轮没有读文件工具（后续改动才加入），所以任何已存在的 skill 和 reference 文件都不可修改：本轮只能 CREATE 新 skill，files 里只能放新建文件。',
     '输出 JSON 中可选的 files 字段（create 或 patch 均可）：',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<注入的 reference baseHash 原样带回；新建文件省略>" }]',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<读到该文件时返回的 SHA-256；新建文件省略>" }]',
   ],
   en: [
     '## Layout: topic skills and reference files',
     'The skill router indexes only the name and the first 400 characters of each skill\'s description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.',
     '- A finding is a sub-topic of an existing topic skill (one concrete procedure, tool usage, or pitfall set) → write it to references/<kebab-name>.md of that skill (in the files field), and add one line to the SKILL.md body that points to it;',
     '- A change to the topic skill\'s overview, scope, or trigger conditions → edit the SKILL.md body only;',
-    '- A genuinely new broad topic that no existing skill can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
-    `- files holds at most ${REFERENCE_FILES_MAX} entries, each at most ${REFERENCE_FILE_MAX_CHARS} characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, echo its injected baseHash; omit baseHash for a new file; edit only files whose full text was injected.`,
+    '- A genuinely new broad topic that no skill in the suggestion block can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
+    `- files holds at most ${REFERENCE_FILES_MAX} entries, each at most ${REFERENCE_FILE_MAX_CHARS} characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, use the SHA-256 the read tool returned for it as its baseHash; omit baseHash for a new file.`,
+    '- This round has no read tool (a later change adds it), so no existing skill and no existing reference file can be edited: this round only CREATEs, and files may only carry new files.',
     'The optional files field of the output JSON, for create or patch:',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<echo the injected reference baseHash; omit for a new file>" }]',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<the SHA-256 returned when you read the file; omit for a new file>" }]',
   ],
 }
 const REVIEW_PROMPT_TEXT = {
@@ -1440,7 +1203,7 @@ const REVIEW_PROMPT_TEXT = {
     '1. 用户纠正了风格/语气/格式/冗长度（"stop doing X" / "too verbose" / "直接给答案"）——这是 FIRST-CLASS 信号；',
     '2. 用户纠正了工作流或步骤顺序；',
     '3. 出现非平凡的技巧、修复、绕过、调试路径、工具用法；',
-    '4. 注入的既有 skill 被发现有错/缺步/过时 → 立即 PATCH 它。',
+    '4. 建议块里列出的既有 skill 被发现有错/缺步/过时 → 在 rationale 里点名它；本轮没有读文件工具，改不了它。',
     '',
     '## 负面清单（禁止沉淀）',
     '- 环境依赖故障（缺二进制、凭据未配置——用户自己能修的）；',
@@ -1450,8 +1213,9 @@ const REVIEW_PROMPT_TEXT = {
     '- 未解决的失败——不能把没验证成功的死胡同包装成可靠流程。',
     '',
     '## 优先序',
-    '1. PATCH 转写中出现过的、注入了全文的 skill；',
-    '2. PATCH 既有 class-level umbrella skill（见下方清单）；',
+    '建议块是本轮唯一的 skill 清单；要改某个 skill 就先读它的文件，读回全文和 SHA-256。',
+    '1. 建议块里的 skill 已覆盖这条经验：本轮不能 patch（没有读文件工具，拿不到 baseHash），把该 skill 名写进 rationale，结论用 nothing；',
+    '2. 建议块之外，若某个既有 class-level umbrella skill 覆盖它：同样写进 rationale，不要 patch；',
     '3. 都不覆盖才 CREATE 新 skill。',
     '',
     '## 命名纪律',
@@ -1482,8 +1246,8 @@ const REVIEW_PROMPT_TEXT = {
     '  "skill": "kebab-case-name",            // create/patch 必填',
     '  "description": "≤500 字符",             // create 必填',
     '  "body": "完整 SKILL.md 正文，不含 frontmatter",  // create/patch 必填',
-    '  "baseHash": "<注入的 suspect baseHash 原样带回>",  // patch 必填',
-    '  "baseDescription": "<注入的 suspect description 原样带回>",  // patch 必填',
+    '  "baseHash": "<读到的 SKILL.md 全文的 SHA-256>",  // patch 必填',
+    '  "baseDescription": "<读到的 SKILL.md 里的 description 原文>",  // patch 必填',
     '  "rationale": "一句话：为什么值得存/不值得存",',
     ...(memoryOn ? [
       '  "memory": {                            // 可选；多数复盘应省略整个字段',
@@ -1495,7 +1259,7 @@ const REVIEW_PROMPT_TEXT = {
     ] : []),
     '}',
     '```',
-    'patch 时 body 必须基于注入的目标全文修改（保留正确内容，只改需要改的），不得凭空重写。',
+    'patch 时 body 必须基于读到的目标全文修改（保留正确内容，只改需要改的），不得凭空重写；本轮没有读文件工具，所以不要输出 patch。',
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
     REVIEW_LANGUAGE_DIRECTIVE.zh,
   ],
@@ -1509,7 +1273,7 @@ const REVIEW_PROMPT_TEXT = {
     '1. The user corrected style/tone/format/verbosity ("stop doing X" / "too verbose" / "just give me the answer") — this is a FIRST-CLASS signal;',
     '2. The user corrected the workflow or the order of steps;',
     '3. A non-trivial technique, fix, workaround, debugging path, or tool usage appeared;',
-    '4. An injected existing skill was found wrong, incomplete, or outdated → PATCH it immediately.',
+    '4. An existing skill listed in the suggestion block was found wrong, incomplete, or outdated → name it in the rationale; this round cannot edit it.',
     '',
     '## Negative list (never distill these)',
     '- Environment dependency failures (missing binary, unconfigured credentials — things the user can fix themselves);',
@@ -1519,8 +1283,9 @@ const REVIEW_PROMPT_TEXT = {
     '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
     '',
     '## Priority order',
-    '1. PATCH a skill that appeared in the transcript and whose full text was injected;',
-    '2. PATCH an existing class-level umbrella skill (see the catalog below);',
+    'The suggestion block is the only skill list this round; to change a skill you read its file, which returns the text and its SHA-256.',
+    '1. A skill in the suggestion block already covers the finding: it cannot be patched this round (no read tool, so no baseHash), so name it in the rationale and answer nothing;',
+    '2. A class-level umbrella skill outside the block covers it: name it in the rationale too; do not patch;',
     '3. Only when neither covers it, CREATE a new skill.',
     '',
     '## Naming discipline',
@@ -1551,8 +1316,8 @@ const REVIEW_PROMPT_TEXT = {
     '  "skill": "kebab-case-name",            // required for create/patch',
     '  "description": "≤500 characters",       // required for create',
     '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
-    '  "baseHash": "<echo the injected suspect baseHash verbatim>",  // required for patch',
-    '  "baseDescription": "<echo the injected suspect description verbatim>",  // required for patch',
+    '  "baseHash": "<SHA-256 of the SKILL.md text you read>",  // required for patch',
+    '  "baseDescription": "<the description field of the SKILL.md you read>",  // required for patch',
     '  "rationale": "One sentence: why it is worth storing, or why not",',
     ...(memoryOn ? [
       '  "memory": {                            // optional; most reviews should omit the whole field',
@@ -1564,7 +1329,7 @@ const REVIEW_PROMPT_TEXT = {
     ] : []),
     '}',
     '```',
-    'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
+    'On patch, the body must be derived by modifying the skill text you read (keep what is correct, change only what must change); never rewrite it from scratch. This round there is no read tool, so do not emit a patch.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
     REVIEW_LANGUAGE_DIRECTIVE.en,
   ],
@@ -1622,9 +1387,9 @@ module.exports = {
   inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt', 'sessions', 'connection'],
   Config,
   __internals: {
-    reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
+    reasonKind, contentToText, renderTranscript,
     extractFencedJson, parseConclusion, parseMemoryConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
-    listReferenceFiles, renderReferenceBlock, REFERENCE_FILE_MAX_CHARS, REFERENCE_FILES_MAX, REVIEW_LAYOUT_TEXT,
+    REFERENCE_FILE_MAX_CHARS, REFERENCE_FILES_MAX, REVIEW_LAYOUT_TEXT,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
     setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
     settingsSchema, Config,
@@ -1633,8 +1398,9 @@ module.exports = {
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
     // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
-    readCatalogFor, catalogLooksProviderless, skillsServiceOf, providerProofOf, providerProofIsPositive,
-    RUNTIME_PROVIDER_NAME, REQUIRED_SKILL_PROVIDER,
+    // The router contract this plugin consumes structurally, exported so a test
+    // can pin the name and the reasons without importing the router package.
+    queryReviewSuggestions, suggestionServiceOf, SKILL_SUGGESTION_SERVICE, REVIEW_RETRY_DELAY_MS,
     LANGUAGE_RETRIES, createLanguageResolver, countLabel,
     REVIEW_PROMPT_TEXT, REVIEW_LANGUAGE_DIRECTIVE,
     MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
@@ -2005,13 +1771,69 @@ module.exports = {
       task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
     }
 
+    // ── Deferred-review retries ───────────────────────────────────────────────
+    // A review the router cannot answer sends no prompt and leaves the trigger
+    // window untouched, so the work is not lost: one retry is scheduled an hour
+    // out. One per session, because a second deferral for the same session means
+    // the first retry would be duplicated work. The retry is dropped when a newer
+    // review for that session starts (it will do the same work on fresher state),
+    // when the session is no longer live at fire time, and when the plugin
+    // unloads — never into a disposed context.
+    const retries = new Map() // sessionId → { timer, reason, retryAt }
+    const cancelRetry = (sessionId) => {
+      const pending = retries.get(sessionId)
+      if (pending === undefined) return false
+      clearTimeout(pending.timer)
+      retries.delete(sessionId)
+      return true
+    }
+    const scheduleRetry = (sessionId, reason) => {
+      cancelRetry(sessionId)
+      const retryAt = Date.now() + REVIEW_RETRY_DELAY_MS
+      const timer = setTimeout(() => {
+        // Drop the entry first: the run it starts must not believe a retry is
+        // still pending for the same session.
+        retries.delete(sessionId)
+        const live = typeof ctx.sessions.get === 'function' ? ctx.sessions.get(sessionId) : undefined
+        if (live === undefined) {
+          trace('review-retry-dropped', { sessionId, reason: 'session-gone' })
+          return
+        }
+        const retryEff = effective()
+        if (!retryEff.enabled) {
+          trace('review-retry-dropped', { sessionId, reason: 'disabled' })
+          return
+        }
+        const task = () => runReview({ session: live, eff: retryEff })
+        if (running === null) task().catch((e) => ctx.logger.warn(`hermes-loop: retry review: ${e && e.message}`))
+        else queued.set(sessionId, task) // the session queue: a newer task replaces this one
+      }, REVIEW_RETRY_DELAY_MS)
+      if (typeof timer.unref === 'function') timer.unref()
+      retries.set(sessionId, { timer, reason, retryAt })
+      trace('review-retry-scheduled', { sessionId, reason, retryAt: new Date(retryAt).toISOString() })
+    }
+
     const runReview = async ({ session, eff, manual = false }) => {
       const sessionId = session.id
+      // A newer review supersedes a pending retry for the same session. It runs
+      // once, for the newest state of the conversation, and the retry that was
+      // waiting to do the same work is dropped rather than doubled.
+      cancelRetry(sessionId)
       const controller = new AbortController()
       const st = stateFor(sessionId)
       // 计数器在进入 runner 时重置（abort 也算消耗窗口，防重触发循环）；
       // 信号同样消费掉——一次复盘消化掉本窗口的加速标记
       const firedSignal = st.signal
+      // A deferral is not a completed review, so it must put the trigger window
+      // back exactly as it stood: consuming the throttle would make the session
+      // wait a full interval beside a retry that is already scheduled.
+      const windowBefore = {
+        turns: st.turns,
+        toolCalls: st.toolCalls,
+        failures: st.failures,
+        signal: st.signal,
+        lastReviewAt: st.lastReviewAt,
+      }
       st.turns = 0
       st.toolCalls = 0
       st.failures = 0
@@ -2023,24 +1845,38 @@ module.exports = {
 
       let handle
       try {
-        // One language decision per review run, so the catalog fallback, the
-        // truncation marker, the memory block, the prompt, and the input
-        // headings cannot disagree.
+        // One language decision per review run, so the truncation marker, the
+        // memory block, the prompt, and the input headings cannot disagree.
         const lang = language()
         // 1. transcript tail
         const messages = session.deriveMessages()
         const transcriptText = renderTranscript(messages, { ...eff, lang })
 
+        // 2. the router decides what this review sees
+        //
+        // The catalog and the keyword picker that read it are gone: the router's
+        // own answer is the input, rendered by the router's own renderer so the
+        // lines match what a turn receives. A missing service and every degraded
+        // answer stop the run here, before the agent exists and before any token
+        // is spent on a review prompt. The router may already have paid for one
+        // judgment request; that cost is unavoidable and is not repeated.
+        const suggestion = await queryReviewSuggestions(ctx, transcriptText)
+        if (suggestion.degraded) {
+          st.turns = windowBefore.turns
+          st.toolCalls = windowBefore.toolCalls
+          st.failures = windowBefore.failures
+          st.signal = windowBefore.signal
+          st.lastReviewAt = windowBefore.lastReviewAt
+          trace('review-deferred', { sessionId, manual, reason: suggestion.reason, detail: suggestion.detail })
+          ctx.logger.warn(`hermes-loop: review for session ${sessionId} deferred (${suggestion.reason}); no prompt sent, one retry in ${Math.round(REVIEW_RETRY_DELAY_MS / 60000)} minutes`)
+          scheduleRetry(sessionId, suggestion.reason)
+          return
+        }
+
         const cwd = session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
 
-        // 2. zero-tool review agent（进程内、独立会话、不污染会话库）
-        //
-        // 目录读取的 scope 选择见 readCatalogFor：优先用「触发本次复盘的会话」
-        // 自己的 agent，因为宿主为它挂过 preset；复盘 agent 只是回退。
+        // 3. zero-tool review agent（进程内、独立会话、不污染会话库）
         const selection = ctx.agentDefaultModel.currentSelection()
-        // 触发会话的 agent 此刻仍然 live（turn/end 由该 agent 自己的事件流驱动），
-        // 它的 ctx 就是宿主 composeAgent 时 mount 过 preset 的那个 scope。
-        const sessionAgent = typeof ctx.agents.get === 'function' ? ctx.agents.get(sessionId) : undefined
         handle = await ctx.agents.create({
           sessionId: 'hermes-loop-review-' + randomUUID(),
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
@@ -2051,83 +1887,16 @@ module.exports = {
         const agent = handle.agent
         trace('review-agent-created', { reviewSession: agent.id })
 
-        // 3. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
-        const snapshot = await readCatalogFor(
-          { sessionAgent, reviewAgent: agent, ctx },
-          { cwd, signal: controller.signal },
-        )
-        const catalog = (snapshot.skills || [])
-          .filter((s) => s.invocation === undefined || s.invocation.modelInvocable !== false)
-          .map((s) => ({
-            name: s.name,
-            description: typeof s.description === 'string' ? s.description.slice(0, eff.catalogDescriptionMax) : '',
-            resourceBase: s.resourceBase,
-          }))
-        const catalogText = catalog.length > 0
-          ? catalog.map((s) => `- ${s.name}: ${s.description}`).join('\n')
-          : REVIEW_INPUT_TEXT[lang].emptyCatalog
-        const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
-        // The catalog can be short in these independent ways. Each gets its own arm,
-        // and the trace records which fired:
-        //  - `complete: false` — a provider threw or returned a partial observation
-        //    (dsh-skill sets cacheable=false on either).
-        //  - `via: 'plugin-ctx'` — no agent-scoped service existed, so this is the
-        //    sibling-only registry. It reports `complete: true`, because every
-        //    provider it asked answered in full.
-        //  - rows came back but every one is a runtime registration — the shipped
-        //    defect. The scope had no discovery provider, the read was still
-        //    genuinely scoped, and it still reported `complete: true`.
-        //
-        // The structural proof is consulted as a POSITIVE only. `'active'` means the
-        // agent's preset carries an enabled, ACTIVE skill provider, so a discovery
-        // provider IS in scope and even an empty catalog is trustworthy. Any other
-        // verdict is NOT read as absence: the global layer is always merged, so an
-        // agent that joined no preset may still see a global-plane provider
-        // (`dsh-base/cordis.patch.yml:297` defines one, which the web bundle disables
-        // in favour of presets). Treating `'no-preset'` as absence would withhold a
-        // valid catalog on such a host.
-        const providerProof = snapshot.providerProof
-        const catalogProviderless = catalogLooksProviderless(snapshot)
-        const catalogShorted = snapshot.complete === false
-          || snapshot.via === 'plugin-ctx'
-          || (!providerProofIsPositive(providerProof) && catalogProviderless)
+        // The ledger records both numbers for every completed review: how many
+        // skills the router suggested, and how large the block that carried them
+        // was. The pair is what makes the prompt's size measurable later.
         trace('review-inputs', {
           sessionId,
           messages: messages.length,
-          catalogSize: catalog.length,
-          catalogVia: snapshot.via,
-          catalogScope: snapshot.scope,
-          catalogProviderProof: providerProof,
-          catalogComplete: snapshot.complete !== false,
-          catalogProviderless,
-          catalogShorted,
-          suspects: suspects.map((s) => s.name),
+          suggestionCount: suggestion.suggestions.length,
+          suggestionChars: suggestion.rendered.length,
+          suggestions: suggestion.suggestions.map((s) => s && s.name).filter((name) => typeof name === 'string'),
         })
-        const suspectBlocks = []
-        const globalRoot = globalSkillsDir() + sep
-        for (const suspect of suspects) {
-          if (!suspect.resourceBase || suspect.resourceBase.kind !== 'directory' || typeof suspect.resourceBase.path !== 'string') continue
-          // writer 只认全局库（applyConclusion 的 globalDir）——项目级技能注入 baseHash
-          // 也必然 patch-missing，白白误导复盘；不注入
-          if (!resolve(suspect.resourceBase.path).startsWith(globalRoot)) continue
-          const file = join(suspect.resourceBase.path, 'SKILL.md')
-          let content
-          try { content = await fsP.readFile(file, 'utf8') } catch { continue }
-          // A body over the suspect limit is never shown cut: a cut view under the
-          // full-file baseHash would let a patch replace the file with its visible
-          // part. Such a skill is listed as not editable this round.
-          if (content.length > SUSPECT_BODY_MAX_CHARS) {
-            suspectBlocks.push(`### suspect: ${suspect.name}\n${REVIEW_INPUT_TEXT[lang].tooLarge}`)
-            continue
-          }
-          const hash = sha256(content)
-          // baseDescription 必须取文件全文里的完整值：目录构造时 description 被截断到
-          // catalogDescriptionMax，用截断值做 CAS 基准会让长描述技能永远 cas-conflict
-          // The suspect's reference files travel with it: full text (for patching) up to
-          // the caps, names only for the rest. See renderReferenceBlock.
-          const references = renderReferenceBlock(await listReferenceFiles(suspect.resourceBase.path), lang)
-          suspectBlocks.push(`### suspect: ${suspect.name}\nbaseHash: ${hash}\nbaseDescription: ${JSON.stringify(descriptionOf(content) || '')}\n\n${content}${references ? `\n\n${references}` : ''}`)
-        }
 
         // 4. 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
         const memoryOn = MEMORY_STORES.some((s) => memoryStoreEnabled(s, eff))
@@ -2182,10 +1951,13 @@ module.exports = {
         controller.signal.addEventListener('abort', onAbort, { once: true })
         try {
           const IT = REVIEW_INPUT_TEXT[lang]
+          // The suggestion section is always present, even when the router found
+          // nothing: a stable prompt shape means the reviewer never has to tell a
+          // missing section from a healthy empty answer.
+          const suggestionBlock = suggestion.rendered !== '' ? suggestion.rendered : IT.noSuggestions
           const prompt = [
             reviewPrompt(eff, lang),
-            '\n## ' + IT.catalog + '\n' + catalogText,
-            suspectBlocks.length > 0 ? '\n## ' + IT.suspects + '\n' + suspectBlocks.join('\n\n---\n\n') : '',
+            '\n## ' + IT.suggestions + '\n' + suggestionBlock,
             memoryBlock,
             '\n## ' + IT.transcript + '\n' + transcriptText,
           ].filter(Boolean).join('\n\n')
@@ -2228,22 +2000,9 @@ module.exports = {
           ctx.logger.info(`hermes-loop: review of session ${sessionId} → nothing. ${conclusion.rationale}`)
           return
         }
-        // A short catalog can hide the skill this review should have patched, or
-        // hide the existing skill a create would duplicate, so the skill half is
-        // withheld either way. The memory channel does not read the skill catalog
-        // and is unaffected, so it still runs.
-        if (catalogShorted && conclusion.action !== 'nothing') {
-          // The three arms are reported separately: in the providerless case
-          // `via` and `complete` both read healthy, so a message naming only
-          // those two would describe a healthy read while withholding on it.
-          ctx.logger.warn(`hermes-loop: review of session ${sessionId} returned ${conclusion.action} '${conclusion.skill}' but the skill catalog was short (scope=${snapshot.scope}, via=${snapshot.via}, proof=${providerProof}, complete=${snapshot.complete !== false}, providerless=${catalogProviderless}, rows=${catalog.length}); skill conclusion withheld`)
-          if (!hasMemoryAction) return
-          conclusion.action = 'nothing'
-          delete conclusion.skill
-          delete conclusion.body
-          delete conclusion.description
-          delete conclusion.files
-        }
+        // A healthy router answered for this session, so a skill conclusion is
+        // written as it stands: there is no second, shorter catalog that could
+        // have hidden the skill this review should have patched.
         await dispatchConclusion(conclusion, { eff, sessionId, session })
       } catch (e) {
         trace('review-error', { sessionId, message: String(e && e.message || e) })
@@ -2446,12 +2205,9 @@ module.exports = {
     ctx.effect(() => {
       const dispose = ctx.on('session/event', onSessionEvent)
       // A queued review is a closure over a session whose agent may be disposed
-      // before the queue drains. Dropping it here is cheaper than running it: the
-      // catalog read would fall back to the review agent, whose scope joined no
-      // preset, so the structural proof would report `no-preset` and withhold the
-      // skill conclusion anyway. The read is not unsafe either way, because
-      // `readCatalogFor` re-derives the scope and the proof at run time; this only
-      // avoids a review that cannot conclude anything about skills.
+      // before the queue drains. The review now reads nothing from that agent's
+      // scope — the router decides the input — so the queue only has to avoid a
+      // review of a session that no longer exists.
       //
       // Payload shape is `{ agent }`, not the agent itself
       // (dsh-agent/lib/index.js:546-550 emits `[carrier, "agent/disposed", { agent }]`),
@@ -2468,6 +2224,10 @@ module.exports = {
         try { if (disposeAgent !== undefined) disposeAgent() } catch {}
         queued.clear()
         windows.clear()
+        // A pending retry dies with the plugin. `clearTimeout` on every entry is
+        // what keeps an hour's wait from firing into a disposed context.
+        for (const pending of retries.values()) clearTimeout(pending.timer)
+        retries.clear()
         if (usageFlushTimer !== null) { clearTimeout(usageFlushTimer); usageFlushTimer = null }
         flushUsage() // 无条件冲洗（内部有 usageReady 门）：curator-only 脏态也不能丢
         if (running !== null) running.controller.abort() // runner finally 里 dispose agent
@@ -2555,7 +2315,7 @@ module.exports = {
       let currentReview = null
       for (const e of activity) {
         if (e.event === 'review-start') {
-          currentReview = { at: e.at, sessionId: e.sessionId, outcome: 'running', action: undefined, skill: undefined, rationale: undefined, suspects: undefined, catalogSize: undefined, messages: undefined, detail: undefined, signal: e.signal }
+          currentReview = { at: e.at, sessionId: e.sessionId, outcome: 'running', action: undefined, skill: undefined, rationale: undefined, suggestionCount: undefined, suggestionChars: undefined, suggestions: undefined, messages: undefined, detail: undefined, signal: e.signal }
           reviews.push(currentReview)
           continue
         }
@@ -2563,8 +2323,14 @@ module.exports = {
         if (e.sessionId !== undefined && e.sessionId !== currentReview.sessionId && e.event !== 'conclusion') continue
         if (e.event === 'review-inputs') {
           currentReview.messages = e.messages
-          currentReview.catalogSize = e.catalogSize
-          currentReview.suspects = e.suspects
+          currentReview.suggestionCount = e.suggestionCount
+          currentReview.suggestionChars = e.suggestionChars
+          currentReview.suggestions = e.suggestions
+        } else if (e.event === 'review-deferred') {
+          // A deferred run is a first-class outcome: the loop's own state says
+          // "deferred" instead of looking idle or still-running.
+          currentReview.outcome = 'deferred'
+          currentReview.detail = e.reason
         } else if (e.event === 'conclusion') {
           currentReview.action = e.action
           currentReview.skill = e.skill || undefined
@@ -2587,6 +2353,9 @@ module.exports = {
         }
       }
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
+      // A deferred review is pending, not idle: the panel renders this instead of
+      // the idle label, and carries the reason so the deferral is explainable.
+      const pendingDeferral = sessionId !== undefined && sessionId !== '' ? retries.get(sessionId) : undefined
       // 目录快照提供每个技能当前的 modelInvocable（frontmatter 治理键的实时状态）。
       // 绝不在此 await 冷重扫（见 refreshInvocable 注释）：立即回上次已知值。
       // 刷新启动也不在这里——冷重扫含同步 IO 段，先启动会把本响应的 flush 堵在事件循环里；
@@ -2671,6 +2440,10 @@ module.exports = {
         settings: eff,
         running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
         queuedCount: queued.size,
+        deferred: pendingDeferral === undefined
+          ? null
+          : { sessionId, reason: pendingDeferral.reason, retryAt: new Date(pendingDeferral.retryAt).toISOString() },
+        deferredCount: retries.size,
         sessions,
         current: current || { turns: 0, toolCalls: 0, lastReviewAt: undefined },
         activity,

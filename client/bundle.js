@@ -33,6 +33,7 @@ window.__ModuleLoader__.load({
         cooldownWait: '{s}s 后可用',
         running: 'review 正在运行…',
         queued: '{n} 个 review 排队中',
+        deferred: '{n} 个复盘推迟，约 1 小时后重试',
         idle: '当前无 review',
         written: '沉淀的技能',
         usage: '技能使用统计',
@@ -115,6 +116,7 @@ window.__ModuleLoader__.load({
         cooldownWait: 'in {s}s',
         running: 'review running…',
         queued: '{n} review(s) queued',
+        deferred: '{n} review(s) deferred, retrying in ~1h',
         idle: 'no review in flight',
         written: 'Distilled skills',
         usage: 'Skill usage stats',
@@ -336,6 +338,9 @@ window.__ModuleLoader__.load({
         var eff = data.settings || {}
         var cur = data.current || {}
         var runningReview = data.running !== null && data.running !== undefined
+        // A deferred review is pending work, not an idle loop: it is scheduled an
+        // hour out, so the header must say so instead of falling through to idle.
+        var deferredCount = typeof data.deferredCount === 'number' ? data.deferredCount : 0
         var cooldownLeft = 0
         if (eff.cooldownMinutes > 0 && cur.lastReviewAt) {
           var remainMs = eff.cooldownMinutes * 60000 - (Date.now() - cur.lastReviewAt)
@@ -352,7 +357,8 @@ window.__ModuleLoader__.load({
             h('span', { className: 'hl-mut' },
               eff.enabled === false ? t('disabled')
                 : runningReview ? t('running')
-                : (data.queuedCount > 0 ? t('queued', { n: data.queuedCount }) : t('idle'))),
+                : (data.queuedCount > 0 ? t('queued', { n: data.queuedCount })
+                  : (deferredCount > 0 ? t('deferred', { n: deferredCount }) : t('idle')))),
             h('span', { style: { flex: 1 } }),
             h('button', {
               className: 'hl-chip' + (runningReview ? ' on' : ''),

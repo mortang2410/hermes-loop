@@ -11,7 +11,7 @@ process.env.DSH_HOME = await mkdtemp(join(tmpdir(), 'r1-5-e2e-home-'))
 const require = createRequire(import.meta.url)
 const plugin = require('../src/index.js')
 
-function fakeServices(conclusionText, { agentSkills, sessionAgent, sessionAgentSkills, presets } = {}) {
+function fakeServices(conclusionText) {
   const created = []
   const agent = {
     session: {
@@ -22,102 +22,24 @@ function fakeServices(conclusionText, { agentSkills, sessionAgent, sessionAgentS
     whenIdle: async () => {},
     cancel() {},
   }
-  // There is ONE context, as in the host: `setupAndPublish` runs
-  // `setup?.(prepared.agent.ctx, prepared.agent)` and `publish` returns that same
-  // agent (dsh-agent-loop/lib/index.js), so what setup receives IS `agent.ctx`.
-  // An earlier fixture modelled two contexts with independent switches, which is
-  // a state the host cannot produce (found in review round 2).
-  //
-  // The context is ALWAYS attached, even when it carries no skills service: the
-  // host always mints one, so "context exists, `get('skills')` returns undefined"
-  // is the real no-service shape. Leaving `agent.ctx` unset instead modelled a
-  // context-less agent that the host never produces (found in review round 3).
-  //
-  // `tools` is present because `setup` always calls `agentCtx.tools.restrict`.
-  const agentCtx = {
-    get: (name) => (name === 'skills' ? agentSkills : undefined),
-    tools: { restrict() {} },
-  }
+  const agentCtx = { get: () => undefined, tools: { restrict() {} } }
   agent.ctx = agentCtx
-  // The triggering session's own agent, as `ctx.agents.get(sessionId)` resolves it.
-  // In the host this agent is the one `composeAgent` mounted a preset onto, so its
-  // scoped read carries the preset's provider rows; the review agent created below
-  // does not. Tests that are not about that distinction leave this unset, which is
-  // the "session agent not live" shape the plugin must tolerate.
-  const liveSessionAgent = sessionAgent === undefined ? undefined : {
-    ...sessionAgent,
-    ctx: { get: (name) => (name === 'skills' ? sessionAgentSkills : undefined) },
-  }
   return {
     created,
     agent,
     agentCtx,
-    sessionAgent: liveSessionAgent,
-    // The host plane exposes the preset registry as `agentPresets`. The plugin
-    // reaches it with `ctx.get('agentPresets', false)`, so a test that does not
-    // supply one models a host without that service, which is the `unprovable`
-    // path the row-label fallback exists for.
-    //
-    // `composedPreset` is bound to the SESSION agent's context, as the host is:
-    // the review agent is created by this plugin and never mounts a preset, so a
-    // proof lookup against it must answer `undefined`. A fake that answered for
-    // every context would model a state the host cannot produce and would hide
-    // exactly the defect under test.
-    presets: presets === undefined ? undefined : buildPresets(presets, liveSessionAgent),
+    suggestions: { query: async () => ({ suggestions: [], rendered: '', degraded: false }) },
     agents: {
       create: async (opts) => {
         created.push(opts)
         if (typeof opts.setup === 'function') await opts.setup(agentCtx, agent)
         return { agent, dispose: async () => {} }
       },
-      get: (id) => (liveSessionAgent !== undefined && sessionAgent && sessionAgent.id === id ? liveSessionAgent : undefined),
+      get: () => undefined,
     },
     agentDefaultModel: { currentSelection: () => ({ provider: 'prov', model: 'mdl' }) },
   }
 }
-
-/**
- * A preset registry as the host exposes it, modelling structural provider proof.
- * `presetId` is the preset the SESSION agent joined; `rows` is that preset's
- * composition inventory. Both default to the healthy shape: the session agent
- * joined `standard` and its skill provider row is enabled and ACTIVE.
- *
- * `presetId: null` models "the session agent joined no preset". A destructuring
- * default replaces an explicit `undefined` argument, so `undefined` cannot
- * express that case in the options object.
- */
-function buildPresets({ presetId = 'standard', rows = [{ entryId: 'skill-filesystem', moduleName: REQUIRED_PROVIDER, enabled: true, fiberState: 2 }] } = {}, liveSessionAgent) {
-  const joined = presetId === null ? undefined : presetId
-  const preset = { id: joined === undefined ? 'standard' : joined, isDefault: false, rows }
-  return {
-    composedPreset: (agentCtx) => (liveSessionAgent !== undefined && agentCtx === liveSessionAgent.ctx ? joined : undefined),
-    compositionInventory: async () => [preset],
-  }
-}
-
-const REQUIRED_PROVIDER = '@deepseek-ai/dsh-skill-filesystem'
-
-// A skills service as the review agent's own ctx exposes it. Tests that are not
-// about the catalog give the agent one of these, so the short-catalog guard does
-// not withhold the skill conclusion they are actually exercising.
-//
-// Rows carry `provider` because `dsh-skill` stamps one on EVERY row it returns:
-// `register()` sets `provider: skill.provider ?? 'runtime'` for runtime skills,
-// and each provider stamps its own name on the rows it discovers (the filesystem
-// provider uses `filesystem`). A row without a provider is therefore not a shape
-// the host can produce, and the guard reads that field to tell a catalog that a
-// real provider answered from one that only merged runtime registrations.
-const catalogService = (skills, complete = true) => ({
-  // `map(provided)` would pass the array INDEX as the second argument, silently
-  // stamping `provider: 0`. Call it through an arrow so the default applies.
-  snapshot: async () => ({ skills: skills.map((row) => provided(row)), complete }),
-})
-
-/**
- * Stamp the provider name a real registry would have put on this row. The row's
- * own `provider` wins when it carries one, so a fixture can model a runtime row.
- */
-const provided = (row, provider = 'filesystem') => ({ ...row, provider: row.provider ?? provider })
 
 function setupPlugin(config, services) {
   const handlers = []
@@ -139,7 +61,7 @@ function setupPlugin(config, services) {
     // its static inject list. `agentPresets` is read that way (strict=false, so a
     // host without the registry yields undefined instead of throwing), which the
     // plugin treats as "cannot prove either way" and degrades to row labels.
-    get: (name) => (name === 'agentPresets' ? services.presets : undefined),
+    get: (name) => (name === 'skillRouterSuggestions' ? services.suggestions : undefined),
     ...services,
   }
   // 宿主面动态注入 webServer（skills-management share-services 同款，已验证可用）
@@ -164,11 +86,10 @@ async function runE2E(config, conclusionText) {
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   const notices = []
-  // These cases are about the memory channel, not the catalog, so the review
-  // agent exposes a usable (empty) catalog and the short-catalog guard stays out
-  // of the way. Without an agent-scoped service the guard would correctly
-  // withhold the skill half, which is not what these cases exercise.
-  const services = fakeServices('```json\n' + conclusionText + '\n```', { agentSkills: catalogService([]) })
+  // These cases are about the memory channel, so the fake router answers with a
+  // healthy empty suggestion block and the review runs exactly as it would on a
+  // host where nothing in the library fits the session.
+  const services = fakeServices('```json\n' + conclusionText + '\n```')
   const t = setupPlugin(config, services)
   const session = {
     id: 'session-mem-e2e',
