@@ -142,6 +142,40 @@ test('applyConclusion: patch passes CAS when unchanged, fails when file drifted'
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
+test('applyConclusion refuses to patch a SKILL.md over the patchable size ceiling', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await mkdir(join(dir, 'big-skill'), { recursive: true })
+    const body = '# big\n' + 'a line of body text\n'.repeat(600)
+    const original = buildSkillMd('big-skill', 'big skill', body)
+    assert.ok(original.length > 8 * 1024, 'fixture check: the file must exceed the 8 KiB ceiling')
+    await writeFile(join(dir, 'big-skill', 'SKILL.md'), original)
+    const out = await applyConclusion(
+      { action: 'patch', skill: 'big-skill', body: '# big\nedited\n', baseHash: sha256(original), baseDescription: 'big skill' },
+      { globalDir: dir })
+    assert.equal(out.result, 'rejected', 'a patch built from a cut view must be refused')
+    assert.match(out.detail, /longer than 8192 characters/, 'the refusal must name the ceiling')
+    assert.equal(await readFile(join(dir, 'big-skill', 'SKILL.md'), 'utf8'), original, 'the file must be unchanged')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('applyConclusion refuses a patch body carrying either truncation marker', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await mkdir(join(dir, 'short-skill'), { recursive: true })
+    const original = buildSkillMd('short-skill', 'short skill', '# short\nbody v1\n')
+    await writeFile(join(dir, 'short-skill', 'SKILL.md'), original)
+    for (const marker of ['…（截断）', '… (truncated)']) {
+      const out = await applyConclusion(
+        { action: 'patch', skill: 'short-skill', body: `# short\nbody v2\n${marker}\n`, baseHash: sha256(original), baseDescription: 'short skill' },
+        { globalDir: dir })
+      assert.equal(out.result, 'rejected', `a body carrying ${JSON.stringify(marker)} must be refused`)
+      assert.match(out.detail, /truncation marker/, 'the refusal must name the marker')
+      assert.equal(await readFile(join(dir, 'short-skill', 'SKILL.md'), 'utf8'), original, 'the file must be unchanged')
+    }
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 // ── reference files: multi-file conclusions (review fix m6rf) ──────────
 
 const TOPIC_SKILL_MD = '---\nname: "topic-skill"\ndescription: "orig"\n---\n\nbody v1\n'

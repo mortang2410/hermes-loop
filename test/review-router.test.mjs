@@ -129,6 +129,16 @@ async function waitForEvent(home, name, count = 1) {
   return []
 }
 
+/** The deferral events of one session, polled: several sessions share one home. */
+async function deferralFor(home, sessionId) {
+  for (let attempt = 0; attempt < 400; attempt++) {
+    const found = (await ledger(home)).filter((e) => e.event === 'review-deferred' && e.sessionId === sessionId)
+    if (found.length > 0) return found
+    await flush(1)
+  }
+  return []
+}
+
 /** Wait until a predicate holds, yielding to real IO between attempts. */
 async function waitFor(predicate, tries = 400) {
   for (let i = 0; i < tries; i++) {
@@ -144,6 +154,20 @@ function fakeRes() {
     body: undefined,
     writeHead(status) { this.status = status },
     end(payload) { this.body = JSON.parse(payload) },
+  }
+}
+
+/** The manual-review request the panel sends: POST /api/hermes-loop/review-now. */
+function postReviewNow(sessionId) {
+  const body = Buffer.from(JSON.stringify({ sessionId }))
+  return {
+    method: 'POST',
+    url: '/api/hermes-loop/review-now',
+    on(name, fn) {
+      if (name === 'data') fn(body)
+      if (name === 'end') fn()
+      return this
+    },
   }
 }
 
@@ -314,7 +338,7 @@ for (const reason of ['disabled', 'no-index', 'embed-failed', 'shortlist-failed'
   })
 }
 
-test('a newer review for the same session cancels the pending retry', async (t) => {
+test('a manual review for the same session cancels the pending retry', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   await withHome(async () => {
     let calls = 0
@@ -325,17 +349,73 @@ test('a newer review for the same session cancels the pending retry', async (t) 
     host.fire(live, completedTurn)
     await flush()
     assert.equal((await statusOf(host, live.id)).deferredCount, 1)
+    assert.equal(calls, 1)
 
-    // The restored counters make the next completed turn fire again, which must
-    // supersede the first retry rather than stack a second one behind it.
-    host.fire(live, completedTurn)
+    // A manual review is not an automatic trigger, so the pending retry does not
+    // suppress it; it supersedes the retry instead of letting it double the work.
+    const res = fakeRes()
+    await host.routes[0].handler(postReviewNow(live.id), res)
+    assert.equal(res.status, 202, 'the manual review must start')
     await flush()
-    assert.equal(calls, 2, 'the newer review ran')
+    assert.equal(calls, 2, 'the manual review ran despite the pending retry')
     assert.equal((await statusOf(host, live.id)).deferredCount, 1, 'only one retry may be pending')
 
     t.mock.timers.tick(HOUR_MS)
     await flush()
-    assert.equal(calls, 3, 'the cancelled retry must not also fire')
+    assert.equal(calls, 3, 'only the retry scheduled by the manual review may fire')
+  })
+})
+
+test('an automatic trigger is suppressed while a retry is pending', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  await withHome(async (home) => {
+    let calls = 0
+    const host = fakeHost({ suggestionService: { query: async () => { calls++; return { suggestions: [], rendered: '', degraded: true, reason: 'judge-timeout' } } } })
+    host.start()
+    const live = session('session-gated')
+    host.sessions.set(live.id, live)
+    host.fire(live, completedTurn)
+    await flush()
+    assert.equal(calls, 1)
+    assert.equal((await statusOf(host, live.id)).deferredCount, 1)
+    assert.equal((await ledger(home)).filter((e) => e.event === 'review-start').length, 1)
+
+    // The restored window makes this turn meet the threshold, but the pending
+    // retry already covers the session: no second router query, no second run.
+    host.fire(live, completedTurn)
+    await flush()
+    assert.equal(calls, 1, 'an automatic trigger must not query while a retry is pending')
+    assert.ok((await waitForEvent(home, 'review-trigger-suppressed'))[0], 'the suppression is recorded')
+    const events = await ledger(home)
+    assert.equal(events.filter((e) => e.event === 'review-start').length, 1, 'no second review may start')
+  })
+})
+
+test('a completed turn recorded while the router query is pending survives the deferral', async () => {
+  await withHome(async () => {
+    let release
+    const host = fakeHost({
+      suggestionService: { query: () => new Promise((resolve) => { release = resolve }) },
+      config: { turnInterval: 2, cooldownMinutes: 0, mode: 'log-only' },
+    })
+    host.start()
+    const live = session('session-pending-turn')
+    host.sessions.set(live.id, live)
+
+    const res = fakeRes()
+    await host.routes[0].handler(postReviewNow(live.id), res)
+    assert.equal(res.status, 202, 'the manual review must start')
+    assert.equal(typeof release, 'function', 'the router query must be pending')
+
+    // A completed turn arrives while the query is still in flight. The deferral
+    // restores the window by difference, so this turn is not overwritten.
+    host.fire(live, completedTurn)
+    release({ suggestions: [], rendered: '', degraded: true, reason: 'judge-timeout' })
+    await flush()
+
+    const status = await statusOf(host, live.id)
+    assert.equal(status.current.turns, 1, 'the turn recorded during the pending query must survive the deferral')
+    assert.equal(status.deferredCount, 1, 'the deferral still schedules its retry')
   })
 })
 
@@ -383,6 +463,30 @@ test('a pending retry is dropped on unload and never fires into a disposed conte
   })
 })
 
+test('a router answer that arrives after unload is dropped: no deferral, no retry', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  await withHome(async (home) => {
+    let release
+    const host = fakeHost({ suggestionService: { query: () => new Promise((resolve) => { release = resolve }) } })
+    host.start()
+    const live = session('session-unload-pending')
+    host.sessions.set(live.id, live)
+    host.fire(live, completedTurn)
+    assert.ok(await waitFor(() => typeof release === 'function'), 'the router query must be in flight before unload')
+
+    // Unload while the query is still pending. Cleanup can clear the retry map and
+    // abort the controller, but it cannot cancel a promise it does not own.
+    for (const cleanup of host.cleanups) { try { cleanup() } catch {} }
+    release({ suggestions: [], rendered: '', degraded: true, reason: 'judge-timeout', detail: 'late answer' })
+    await flush(40)
+
+    const events = await ledger(home)
+    assert.ok(!events.some((e) => e.event === 'review-deferred'), 'a late answer must not record a deferral')
+    assert.ok(!events.some((e) => e.event === 'review-retry-scheduled'), 'a late answer must not schedule a retry')
+    assert.equal((await statusOf(host, live.id)).deferredCount, 0, 'no retry may be pending after unload')
+  })
+})
+
 test('a suggestion query that throws is treated as degradation, not as a clean run', async () => {
   await withHome(async (home) => {
     const t = fakeHost({ suggestionService: { query: async () => { throw new Error('socket closed') } } })
@@ -395,5 +499,43 @@ test('a suggestion query that throws is treated as degradation, not as a clean r
     const deferred = (await waitForEvent(home, 'review-deferred'))[0]
     assert.ok(deferred, 'a thrown query still defers the run')
     assert.match(deferred.detail, /socket closed/, 'the failure is recorded')
+  })
+})
+
+test('a router result that is an array defers instead of running a healthy empty review', async () => {
+  await withHome(async (home) => {
+    const t = fakeHost({ suggestionService: { query: async () => [] } })
+    t.start()
+    const live = session('session-malformed-array')
+    t.sessions.set(live.id, live)
+    t.fire(live, completedTurn)
+    await flush()
+    assert.equal(t.prompt(), undefined, 'a malformed result must not send a review prompt')
+    assert.equal(t.created.length, 0, 'a malformed result must not create the review agent')
+    const deferred = await deferralFor(home, live.id)
+    assert.equal(deferred.length, 1, 'exactly one deferral must be recorded')
+    assert.equal(deferred[0].reason, 'query-failed', 'the deferral must name the contract failure')
+  })
+})
+
+test('every router result outside the published contract defers as query-failed', async () => {
+  await withHome(async (home) => {
+    const shapes = [
+      ['missing degraded', { suggestions: [], rendered: '' }],
+      ['non-array suggestions', { suggestions: 'none', rendered: '', degraded: false }],
+      ['non-string rendered', { suggestions: [], rendered: 42, degraded: false }],
+    ]
+    for (const [label, answer] of shapes) {
+      const t = fakeHost({ suggestionService: { query: async () => answer } })
+      t.start()
+      const live = session(`session-malformed-${label.replace(/\W+/g, '-')}`)
+      t.sessions.set(live.id, live)
+      t.fire(live, completedTurn)
+      await flush()
+      assert.equal(t.prompt(), undefined, `${label}: no review prompt may be sent`)
+      const deferred = await deferralFor(home, live.id)
+      assert.equal(deferred.length, 1, `${label}: exactly one deferral must be recorded`)
+      assert.equal(deferred[0].reason, 'query-failed', `${label}: the deferral must name the contract failure`)
+    }
   })
 })

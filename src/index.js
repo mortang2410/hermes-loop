@@ -383,6 +383,16 @@ async function queryReviewSuggestions(ctx, text) {
   if (result === null || typeof result !== 'object') {
     return { suggestions: [], rendered: '', degraded: true, reason: 'query-failed', detail: 'the suggestion service answered with no result object' }
   }
+  // The published result contract has three required fields, and `[]` passes a
+  // bare typeof check. Normalising a malformed answer into a healthy empty one
+  // would send a review prompt on a router failure, so every shape outside the
+  // contract lands on the same degradation arm before any field is read.
+  if (Array.isArray(result)
+    || !Array.isArray(result.suggestions)
+    || typeof result.rendered !== 'string'
+    || typeof result.degraded !== 'boolean') {
+    return { suggestions: [], rendered: '', degraded: true, reason: 'query-failed', detail: 'the suggestion service answered outside its result contract' }
+  }
   if (result.degraded === true) {
     // The contract says a degraded answer carries no block; do not propagate a
     // field that contradicts it, because the caller would then render one.
@@ -1019,7 +1029,7 @@ const LOOP_AWARE_TEXT = {
 
 const REVIEW_INPUT_TEXT = {
   zh: {
-    suggestions: '本会话的技能建议（skill 路由器选出；每行一个 skill，含 name、description 和可读取的路径）',
+    suggestions: '本会话的技能建议（skill 路由器选出；每行一个 skill，含 name、description 和路径（若有））',
     noSuggestions: '（路由器本轮没有建议任何 skill——本轮只复盘记忆通道）',
     transcript: '会话转写（保尾截断）',
     reasoning: '（推理中）',
@@ -1027,7 +1037,7 @@ const REVIEW_INPUT_TEXT = {
     truncated: '\n…（截断）',
   },
   en: {
-    suggestions: 'Skill suggestions for this session (chosen by the skill router; one line per skill with its name, description, and the path to read when the catalog supplies one)',
+    suggestions: 'Skill suggestions for this session (chosen by the skill router; one line per skill with its name, description, and the path when the catalog supplies one)',
     noSuggestions: '(the router suggested no skills this round; only the memory channel is reviewed)',
     transcript: 'Session transcript (tail-preserving truncation)',
     reasoning: '(reasoning)',
@@ -1157,39 +1167,37 @@ function curatorTransitions(records, usage, { now, staleDays, archiveDays }) {
 // skill 与记忆条目都是中文，模型顺着它们写）。所以产物语言必须显式钉住，且随同一
 // 份 lang 变化——协议换成哪种语言，description/body/memory.text/rationale 就必须
 // 用哪种语言。写明「与转写/目录/记忆的语言无关」是因为漂移源正是它们的语言。
-// 这两个串是 zh 分支相对上游 0.1.16 唯一的增量，parity 测试按「上游 + 本行」比对。
+// 这两个串由 test/i18n.test.mjs 逐字钉住（上游没有英文对照，语言指令只能自钉）。
 const REVIEW_LANGUAGE_DIRECTIVE = {
   zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写或记忆条目本身用什么语言无关。',
   en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript or memory entries happen to use.',
 }
 /**
  * Layout rules for topic skills and reference files, shared by the review prompt
- * in both languages. Kept as one named block so the zh parity oracle in
- * test/i18n.test.mjs can strip exactly this block, the way it strips the
- * directive line, and nothing else.
+ * in both languages. Kept as one named block so the layout pin in
+ * test/i18n.test.mjs compares exactly this block, in both languages, and
+ * nothing else.
  */
 const REVIEW_LAYOUT_TEXT = {
   zh: [
     '## 布局：topic skill 与 reference 文件',
     '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
-    '- 经验是某个既有 topic skill 的子主题（一个具体流程、工具用法、踩坑集）→ 写入该 skill 的 references/<kebab-name>.md（放入 files 字段），并在 SKILL.md 正文里加一行指向它；',
-    '- 只改 topic skill 的概述、适用范围或触发条件 → 只改 SKILL.md 正文；',
+    '- 本轮没有读文件工具，任何已存在的 skill 和 reference 文件都不可修改：不能 patch 已有 skill，也不能改已有 reference 文件；',
+    '- 经验属于某个既有 topic skill 的子主题（建议块里能看出）→ 本轮写不进去；把该 skill 名写进 rationale，结论用 nothing；',
     '- 确实是新的宽主题，且建议块里没有任何 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
-    `- files 最多 ${REFERENCE_FILES_MAX} 个，每个不超过 ${REFERENCE_FILE_MAX_CHARS} 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时，把读文件工具返回的 SHA-256 作为它的 baseHash；新建文件省略 baseHash。`,
-    '- 本轮没有读文件工具（后续改动才加入），所以任何已存在的 skill 和 reference 文件都不可修改：本轮只能 CREATE 新 skill，files 里只能放新建文件。',
-    '输出 JSON 中可选的 files 字段（create 或 patch 均可）：',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<读到该文件时返回的 SHA-256；新建文件省略>" }]',
+    `- CREATE 时可在 files 里附带新建的 reference 文件：最多 ${REFERENCE_FILES_MAX} 个，每个不超过 ${REFERENCE_FILE_MAX_CHARS} 字符，路径只能是 references/<kebab-name>.md；只能放新建文件，不要提供 baseHash。`,
+    '输出 JSON 中可选的 files 字段（仅 create 使用）：',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文" }]',
   ],
   en: [
     '## Layout: topic skills and reference files',
     'The skill router indexes only the name and the first 400 characters of each skill\'s description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.',
-    '- A finding is a sub-topic of an existing topic skill (one concrete procedure, tool usage, or pitfall set) → write it to references/<kebab-name>.md of that skill (in the files field), and add one line to the SKILL.md body that points to it;',
-    '- A change to the topic skill\'s overview, scope, or trigger conditions → edit the SKILL.md body only;',
+    '- This round has no read tool, so no existing skill and no existing reference file can be changed: an existing skill cannot be patched, and an existing reference file cannot be edited;',
+    '- The finding is a sub-topic of an existing topic skill (visible in the suggestion block) → this round cannot write it; name that skill in the rationale and answer nothing;',
     '- A genuinely new broad topic that no skill in the suggestion block can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
-    `- files holds at most ${REFERENCE_FILES_MAX} entries, each at most ${REFERENCE_FILE_MAX_CHARS} characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, use the SHA-256 the read tool returned for it as its baseHash; omit baseHash for a new file.`,
-    '- This round has no read tool (a later change adds it), so no existing skill and no existing reference file can be edited: this round only CREATEs, and files may only carry new files.',
-    'The optional files field of the output JSON, for create or patch:',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<the SHA-256 returned when you read the file; omit for a new file>" }]',
+    `- On CREATE, files may carry new reference files: at most ${REFERENCE_FILES_MAX} entries, each at most ${REFERENCE_FILE_MAX_CHARS} characters, with paths only of the form references/<kebab-name>.md; new files only, and never a baseHash.`,
+    'The optional files field of the output JSON, for create only:',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text" }]',
   ],
 }
 const REVIEW_PROMPT_TEXT = {
@@ -1213,14 +1221,13 @@ const REVIEW_PROMPT_TEXT = {
     '- 未解决的失败——不能把没验证成功的死胡同包装成可靠流程。',
     '',
     '## 优先序',
-    '建议块是本轮唯一的 skill 清单；要改某个 skill 就先读它的文件，读回全文和 SHA-256。',
+    '建议块是本轮唯一的 skill 清单；本轮没有读文件工具，不能读任何 skill 文件，也不能改任何既有 skill。',
     '1. 建议块里的 skill 已覆盖这条经验：本轮不能 patch（没有读文件工具，拿不到 baseHash），把该 skill 名写进 rationale，结论用 nothing；',
-    '2. 建议块之外，若某个既有 class-level umbrella skill 覆盖它：同样写进 rationale，不要 patch；',
-    '3. 都不覆盖才 CREATE 新 skill。',
+    '2. 建议块里没有任何 skill 能承载这条经验 → CREATE 新 skill；建议块之外的 skill 一律不算覆盖。',
     '',
     '## 命名纪律',
     'kebab-case class-level 名字。禁止 PR 号、错误串、一次性代号（fix-X / debug-Y 之类）。',
-    '如果名字只对今天的任务有意义，那就是错的——回到优先序 1/2 去扩写既有 skill。',
+    '如果名字只对今天的任务有意义，那就是错的：改用一个 class-level 名字，不要为一次性任务建 skill。',
     '',
     ...REVIEW_LAYOUT_TEXT.zh,
     ...(memoryOn ? [
@@ -1246,8 +1253,8 @@ const REVIEW_PROMPT_TEXT = {
     '  "skill": "kebab-case-name",            // create/patch 必填',
     '  "description": "≤500 字符",             // create 必填',
     '  "body": "完整 SKILL.md 正文，不含 frontmatter",  // create/patch 必填',
-    '  "baseHash": "<读到的 SKILL.md 全文的 SHA-256>",  // patch 必填',
-    '  "baseDescription": "<读到的 SKILL.md 里的 description 原文>",  // patch 必填',
+    '  "baseHash": "<SKILL.md 全文的 SHA-256>",  // patch 必填；本轮没有读文件工具，不要输出',
+    '  "baseDescription": "<SKILL.md 里的 description 原文>",  // patch 必填；本轮没有读文件工具，不要输出',
     '  "rationale": "一句话：为什么值得存/不值得存",',
     ...(memoryOn ? [
       '  "memory": {                            // 可选；多数复盘应省略整个字段',
@@ -1259,7 +1266,7 @@ const REVIEW_PROMPT_TEXT = {
     ] : []),
     '}',
     '```',
-    'patch 时 body 必须基于读到的目标全文修改（保留正确内容，只改需要改的），不得凭空重写；本轮没有读文件工具，所以不要输出 patch。',
+    'patch 需要读文件工具才能基于目标全文修改；本轮没有读文件工具，所以不要输出 patch。',
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
     REVIEW_LANGUAGE_DIRECTIVE.zh,
   ],
@@ -1283,14 +1290,13 @@ const REVIEW_PROMPT_TEXT = {
     '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
     '',
     '## Priority order',
-    'The suggestion block is the only skill list this round; to change a skill you read its file, which returns the text and its SHA-256.',
+    'The suggestion block is the only skill list this round; this round has no read tool, so it cannot read any skill file and cannot change any existing skill.',
     '1. A skill in the suggestion block already covers the finding: it cannot be patched this round (no read tool, so no baseHash), so name it in the rationale and answer nothing;',
-    '2. A class-level umbrella skill outside the block covers it: name it in the rationale too; do not patch;',
-    '3. Only when neither covers it, CREATE a new skill.',
+    '2. No skill in the suggestion block can carry the finding → CREATE a new skill; a skill outside the block never counts as coverage.',
     '',
     '## Naming discipline',
     'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
-    'If the name only makes sense for today\'s task, it is wrong — go back to priority 1/2 and extend an existing skill instead.',
+    'If the name only makes sense for today\'s task, it is wrong: use a class-level name instead, and never create a skill for a one-off task.',
     '',
     ...REVIEW_LAYOUT_TEXT.en,
     ...(memoryOn ? [
@@ -1316,8 +1322,8 @@ const REVIEW_PROMPT_TEXT = {
     '  "skill": "kebab-case-name",            // required for create/patch',
     '  "description": "≤500 characters",       // required for create',
     '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
-    '  "baseHash": "<SHA-256 of the SKILL.md text you read>",  // required for patch',
-    '  "baseDescription": "<the description field of the SKILL.md you read>",  // required for patch',
+    '  "baseHash": "<SHA-256 of the SKILL.md text>",  // required for patch; this round has no read tool, so do not emit it',
+    '  "baseDescription": "<the description field of the SKILL.md>",  // required for patch; this round has no read tool, so do not emit it',
     '  "rationale": "One sentence: why it is worth storing, or why not",',
     ...(memoryOn ? [
       '  "memory": {                            // optional; most reviews should omit the whole field',
@@ -1329,7 +1335,7 @@ const REVIEW_PROMPT_TEXT = {
     ] : []),
     '}',
     '```',
-    'On patch, the body must be derived by modifying the skill text you read (keep what is correct, change only what must change); never rewrite it from scratch. This round there is no read tool, so do not emit a patch.',
+    'A patch needs a read tool to derive the body from the target text; this round has no read tool, so do not emit a patch.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
     REVIEW_LANGUAGE_DIRECTIVE.en,
   ],
@@ -1779,6 +1785,12 @@ module.exports = {
     // review for that session starts (it will do the same work on fresher state),
     // when the session is no longer live at fire time, and when the plugin
     // unloads — never into a disposed context.
+    //
+    // Set by the cleanup callback before it tears anything down. Cleanup cannot
+    // cancel a router promise it does not own, so the runner checks this flag
+    // when the answer arrives; without it a late degraded answer writes a
+    // deferral and schedules a retry into a disposed context.
+    let disposed = false
     const retries = new Map() // sessionId → { timer, reason, retryAt }
     const cancelRetry = (sessionId) => {
       const pending = retries.get(sessionId)
@@ -1788,6 +1800,7 @@ module.exports = {
       return true
     }
     const scheduleRetry = (sessionId, reason) => {
+      if (disposed) return
       cancelRetry(sessionId)
       const retryAt = Date.now() + REVIEW_RETRY_DELAY_MS
       const timer = setTimeout(() => {
@@ -1861,11 +1874,19 @@ module.exports = {
         // is spent on a review prompt. The router may already have paid for one
         // judgment request; that cost is unavoidable and is not repeated.
         const suggestion = await queryReviewSuggestions(ctx, transcriptText)
+        // The plugin may have unloaded while the router was answering. Drop the
+        // answer here: no deferral event, no retry timer, and no agent created
+        // into a disposed context.
+        if (disposed) return
         if (suggestion.degraded) {
-          st.turns = windowBefore.turns
-          st.toolCalls = windowBefore.toolCalls
-          st.failures = windowBefore.failures
-          st.signal = windowBefore.signal
+          // Restore the window by difference. The counters were reset on entry,
+          // so anything they hold now arrived while the query was pending and
+          // must survive the deferral; assigning the entry-time snapshot back
+          // would lose a completed turn and its threshold progress.
+          st.turns += windowBefore.turns
+          st.toolCalls += windowBefore.toolCalls
+          st.failures += windowBefore.failures
+          if (st.signal === undefined) st.signal = windowBefore.signal
           st.lastReviewAt = windowBefore.lastReviewAt
           trace('review-deferred', { sessionId, manual, reason: suggestion.reason, detail: suggestion.detail })
           ctx.logger.warn(`hermes-loop: review for session ${sessionId} deferred (${suggestion.reason}); no prompt sent, one retry in ${Math.round(REVIEW_RETRY_DELAY_MS / 60000)} minutes`)
@@ -2190,6 +2211,15 @@ module.exports = {
         // 冷却期内的标记保留到冷却结束后的下一个 turn 尾再消费
         if (!cooledDown || (!hitTurn && !hitTools && !accelerated)) return
 
+        // A pending retry already covers this session's next review. Without this
+        // gate every completed turn would start another router query for the hour
+        // the retry waits, because a deferral restores the window and lastReviewAt.
+        // A manual review request does not come through here and still runs.
+        if (retries.has(sessionId)) {
+          trace('review-trigger-suppressed', { sessionId, reason: 'retry-pending' })
+          return
+        }
+
         const task = () => runReview({ session, eff })
         if (running === null) {
           // 同步直调（running 立即置位），不隔微任务
@@ -2220,6 +2250,9 @@ module.exports = {
       }
       const disposeAgent = typeof ctx.on === 'function' ? ctx.on('agent/disposed', dropQueued) : undefined
       return () => {
+        // First, so a router answer already in flight is dropped when it
+        // resolves: the map clearing below cannot reach that promise.
+        disposed = true
         try { dispose() } catch {}
         try { if (disposeAgent !== undefined) disposeAgent() } catch {}
         queued.clear()

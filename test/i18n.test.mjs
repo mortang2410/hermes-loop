@@ -442,7 +442,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     empty: '(empty)',
   }, 'the English review memory block copy changed')
   assert.deepEqual(I.REVIEW_INPUT_TEXT.en, {
-    suggestions: 'Skill suggestions for this session (chosen by the skill router; one line per skill with its name, description, and the path to read when the catalog supplies one)',
+    suggestions: 'Skill suggestions for this session (chosen by the skill router; one line per skill with its name, description, and the path when the catalog supplies one)',
     noSuggestions: '(the router suggested no skills this round; only the memory channel is reviewed)',
     transcript: 'Session transcript (tail-preserving truncation)',
     reasoning: '(reasoning)',
@@ -496,24 +496,22 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
     '',
     '## Priority order',
-    'The suggestion block is the only skill list this round; to change a skill you read its file, which returns the text and its SHA-256.',
+    'The suggestion block is the only skill list this round; this round has no read tool, so it cannot read any skill file and cannot change any existing skill.',
     '1. A skill in the suggestion block already covers the finding: it cannot be patched this round (no read tool, so no baseHash), so name it in the rationale and answer nothing;',
-    '2. A class-level umbrella skill outside the block covers it: name it in the rationale too; do not patch;',
-    '3. Only when neither covers it, CREATE a new skill.',
+    '2. No skill in the suggestion block can carry the finding → CREATE a new skill; a skill outside the block never counts as coverage.',
     '',
     '## Naming discipline',
     'Use kebab-case class-level names. No PR numbers, error strings, or one-off codenames (fix-X / debug-Y style).',
-    'If the name only makes sense for today\'s task, it is wrong — go back to priority 1/2 and extend an existing skill instead.',
+    'If the name only makes sense for today\'s task, it is wrong: use a class-level name instead, and never create a skill for a one-off task.',
     '',
     '## Layout: topic skills and reference files',
     'The skill router indexes only the name and the first 400 characters of each skill\'s description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.',
-    '- A finding is a sub-topic of an existing topic skill (one concrete procedure, tool usage, or pitfall set) → write it to references/<kebab-name>.md of that skill (in the files field), and add one line to the SKILL.md body that points to it;',
-    '- A change to the topic skill\'s overview, scope, or trigger conditions → edit the SKILL.md body only;',
+    '- This round has no read tool, so no existing skill and no existing reference file can be changed: an existing skill cannot be patched, and an existing reference file cannot be edited;',
+    '- The finding is a sub-topic of an existing topic skill (visible in the suggestion block) → this round cannot write it; name that skill in the rationale and answer nothing;',
     '- A genuinely new broad topic that no skill in the suggestion block can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
-    '- files holds at most 8 entries, each at most 32768 characters, with paths only of the form references/<kebab-name>.md. To change an existing reference file, use the SHA-256 the read tool returned for it as its baseHash; omit baseHash for a new file.',
-    '- This round has no read tool (a later change adds it), so no existing skill and no existing reference file can be edited: this round only CREATEs, and files may only carry new files.',
-    'The optional files field of the output JSON, for create or patch:',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text", "baseHash": "<the SHA-256 returned when you read the file; omit for a new file>" }]',
+    '- On CREATE, files may carry new reference files: at most 8 entries, each at most 32768 characters, with paths only of the form references/<kebab-name>.md; new files only, and never a baseHash.',
+    'The optional files field of the output JSON, for create only:',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "complete file text" }]',
     '',
     '## Memory (optional conclusion — most reviews should produce none)',
     'Besides skills, consider writing memory only when the conversation **explicitly** surfaced:',
@@ -533,8 +531,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '  "skill": "kebab-case-name",            // required for create/patch',
     '  "description": "≤500 characters",       // required for create',
     '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
-    '  "baseHash": "<SHA-256 of the SKILL.md text you read>",  // required for patch',
-    '  "baseDescription": "<the description field of the SKILL.md you read>",  // required for patch',
+    '  "baseHash": "<SHA-256 of the SKILL.md text>",  // required for patch; this round has no read tool, so do not emit it',
+    '  "baseDescription": "<the description field of the SKILL.md>",  // required for patch; this round has no read tool, so do not emit it',
     '  "rationale": "One sentence: why it is worth storing, or why not",',
     '  "memory": {                            // optional; most reviews should omit the whole field',
     '    "action": "nothing" | "add" | "replace" | "remove",',
@@ -544,12 +542,12 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '    "rationale": "Why record / change / delete" }',
     '}',
     '```',
-    'On patch, the body must be derived by modifying the skill text you read (keep what is correct, change only what must change); never rewrite it from scratch. This round there is no read tool, so do not emit a patch.',
+    'A patch needs a read tool to derive the body from the target text; this round has no read tool, so do not emit a patch.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
     'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript or memory entries happen to use.',
   ], 'the English review prompt changed')
   const enOff = I.REVIEW_PROMPT_TEXT.en(false)
-  assert.equal(enOff.length, 55, 'the English memory-off prompt must drop exactly the two memory blocks')
+  assert.equal(enOff.length, 53, 'the English memory-off prompt must drop exactly the two memory blocks')
   assert.ok(!enOff.some((l) => l.startsWith('## Memory')), 'no memory guidance section when memory is off')
   assert.ok(!enOff.some((l) => l.includes('"memory":')), 'no memory conclusion schema when memory is off')
   const division = enOff.indexOf('## Division of labour')
@@ -570,6 +568,51 @@ test('the review prompt teaches the topic-skill / reference split in both langua
     assert.ok(text.includes('400'), `${label}: the router's 400-character indexing limit is missing`)
   }
   assert.match(en, /only the name and the first 400 characters/)
+})
+
+test('the review prompt limits this round to the suggestion block and new skills', () => {
+  // This round has no read tool (d3ek adds one). A prompt that tells the model to
+  // read a file, patch an existing skill, or extend a reference file describes a
+  // different round: the model cannot produce the baseHash those actions need, so
+  // the contradiction turns into an unsupported patch or a claim that an unlisted
+  // skill already covers the finding.
+  const forbidden = {
+    zh: [
+      '要改某个 skill 就先读它的文件',
+      '建议块之外，若某个既有 class-level umbrella skill',
+      '写入该 skill 的 references/',
+      '只改 SKILL.md 正文',
+      '读文件工具返回的 SHA-256',
+      '读到的 SKILL.md 全文',
+      '回到优先序 1/2 去扩写既有 skill',
+    ],
+    en: [
+      'to change a skill you read its file',
+      'A class-level umbrella skill outside the block',
+      'write it to references/<kebab-name>.md of that skill',
+      'edit the SKILL.md body only',
+      'the SHA-256 the read tool returned',
+      'SHA-256 of the SKILL.md text you read',
+      'go back to priority 1/2 and extend an existing skill',
+    ],
+  }
+  const required = {
+    zh: ['建议块是本轮唯一的 skill 清单', '本轮没有读文件工具', '建议块之外的 skill 一律不算覆盖', 'CREATE 新 skill'],
+    en: ['The suggestion block is the only skill list this round', 'this round has no read tool', 'a skill outside the block never counts as coverage', 'CREATE a new skill'],
+  }
+  for (const lang of ['zh', 'en']) {
+    const prompt = I.reviewPrompt({ memoryEnabled: true, userProfileEnabled: true }, lang)
+    for (const phrase of forbidden[lang]) {
+      assert.ok(!prompt.includes(phrase), `${lang}: the prompt still describes a read-tool workflow: ${phrase}`)
+    }
+    for (const phrase of required[lang]) {
+      assert.ok(prompt.includes(phrase), `${lang}: the prompt is missing its no-read-tool rule: ${phrase}`)
+    }
+  }
+  // The per-file baseHash echo is gone: files may only carry new files, so there
+  // is no existing file whose hash the review could echo.
+  assert.ok(!I.REVIEW_LAYOUT_TEXT.zh[7].includes('baseHash'), 'zh: the files example must not echo a per-file baseHash')
+  assert.ok(!I.REVIEW_LAYOUT_TEXT.en[7].includes('baseHash'), 'en: the files example must not echo a per-file baseHash')
 })
 
 test('each review prompt pins the artifact language to its own language', () => {
@@ -894,13 +937,12 @@ test('the zh review layout block is pinned to a test-owned literal', () => {
   assert.deepEqual(I.REVIEW_LAYOUT_TEXT.zh, [
     '## 布局：topic skill 与 reference 文件',
     '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
-    '- 经验是某个既有 topic skill 的子主题（一个具体流程、工具用法、踩坑集）→ 写入该 skill 的 references/<kebab-name>.md（放入 files 字段），并在 SKILL.md 正文里加一行指向它；',
-    '- 只改 topic skill 的概述、适用范围或触发条件 → 只改 SKILL.md 正文；',
+    '- 本轮没有读文件工具，任何已存在的 skill 和 reference 文件都不可修改：不能 patch 已有 skill，也不能改已有 reference 文件；',
+    '- 经验属于某个既有 topic skill 的子主题（建议块里能看出）→ 本轮写不进去；把该 skill 名写进 rationale，结论用 nothing；',
     '- 确实是新的宽主题，且建议块里没有任何 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
-    '- files 最多 8 个，每个不超过 32768 字符，路径只能是 references/<kebab-name>.md。修改已有 reference 文件时，把读文件工具返回的 SHA-256 作为它的 baseHash；新建文件省略 baseHash。',
-    '- 本轮没有读文件工具（后续改动才加入），所以任何已存在的 skill 和 reference 文件都不可修改：本轮只能 CREATE 新 skill，files 里只能放新建文件。',
-    '输出 JSON 中可选的 files 字段（create 或 patch 均可）：',
-    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文", "baseHash": "<读到该文件时返回的 SHA-256；新建文件省略>" }]',
+    '- CREATE 时可在 files 里附带新建的 reference 文件：最多 8 个，每个不超过 32768 字符，路径只能是 references/<kebab-name>.md；只能放新建文件，不要提供 baseHash。',
+    '输出 JSON 中可选的 files 字段（仅 create 使用）：',
+    '  "files": [{ "path": "references/<kebab-name>.md", "content": "完整文件正文" }]',
   ], 'the zh layout block changed; update this literal only after checking the router facts it states')
   // The routing facts the block states: the router reads the first 400 characters
   // of a description, and reference files are never indexed.
