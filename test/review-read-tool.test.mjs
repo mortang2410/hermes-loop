@@ -13,7 +13,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
@@ -89,21 +89,53 @@ function fakeHost({ suggestions = [], respond, mode = 'log-only' } = {}) {
   const created = []
   const events = []
   let inSetup = false
+  // The inherited layer: every scope starts with these tools. `restrict` filters
+  // only this layer, and the scope's own registrations are added after the
+  // filter (dsh-tools registry `view()`), so a scope with `allow: []` and one
+  // registration sees exactly that registration, while a sibling scope that
+  // never restricted still sees the inherited tool.
+  const inherited = new Map([
+    ['inherited_tool', { name: 'inherited_tool', description: 'a tool every normal agent inherits', parameters: { type: 'object', properties: {} } }],
+  ])
+  const registered = []
+  const registrations = []
+  const restrictions = []
+  const visibleInherited = () => {
+    const names = new Set(inherited.keys())
+    for (const filter of restrictions) {
+      if (filter === undefined || filter === null) continue
+      for (const name of [...names]) {
+        const allowed = filter.allow === undefined
+          || (Array.isArray(filter.allow) && filter.allow.includes(name))
+        const denied = Array.isArray(filter.deny) && filter.deny.includes(name)
+        if (!allowed || denied) names.delete(name)
+      }
+    }
+    return [...names].map((name) => inherited.get(name))
+  }
   const tools = {
-    registered: [],
-    registrations: [],
-    restrictions: [],
+    inherited,
+    registered,
+    registrations,
+    restrictions,
     register(definition) {
-      tools.registered.push(definition)
-      tools.registrations.push({ name: definition.name, duringSetup: inSetup })
+      registered.push(definition)
+      registrations.push({ name: definition.name, duringSetup: inSetup })
       return () => {}
     },
     restrict(filter) {
-      tools.restrictions.push(filter)
+      restrictions.push(filter)
       return () => {}
     },
     schemas() {
-      return tools.registered.map(({ name, description, parameters }) => ({ name, description, parameters }))
+      const visible = new Map(visibleInherited().map((definition) => [definition.name, definition]))
+      for (const definition of registered) visible.set(definition.name, definition)
+      return [...visible.values()].map(({ name, description, parameters }) => ({ name, description, parameters }))
+    },
+    siblingSchemas() {
+      // A normal agent's scope: the same inherited layer, no restriction of its
+      // own, no review registration.
+      return [...inherited.values()].map(({ name, description, parameters }) => ({ name, description, parameters }))
     },
   }
   const agentCtx = { get: () => undefined, tools }
@@ -329,12 +361,59 @@ test('a symlinked global skill is readable through its catalog realpath and patc
   })
 })
 
+test('a SKILL.md that is itself a symlink is refused and the link and target are left alone', async () => {
+  await withHome(async (home) => {
+    // A directory-shaped entry whose SKILL.md is a file-level link. The catalog
+    // reports the link target, so this path can reach the tool even though the
+    // writer patches by entry name and renames over the entry path: the rename
+    // would replace the link with a regular file and leave the target stale.
+    const externalDir = join(home, 'dotfiles-skills', 'file-linked')
+    await mkdir(externalDir, { recursive: true })
+    const externalFile = join(externalDir, 'SKILL.md')
+    const text = `---\nname: "file-linked"\ndescription: "linked description"\n---\n\nlinked body line\n`
+    await writeFile(externalFile, text)
+    const entryDir = join(home, 'skills', 'file-linked')
+    await mkdir(entryDir, { recursive: true })
+    const link = join(entryDir, 'SKILL.md')
+    await symlink(externalFile, link, 'file')
+    const catalogPath = await realpath(link)
+
+    const tool = I.buildReviewSkillReadTool()
+    // Both routes name the same library skill, so both must refuse before a
+    // read: the entry path and the realpath the catalog reports.
+    for (const path of [link, catalogPath]) {
+      await assert.rejects(
+        () => tool.execute({ path }, {}),
+        (error) => {
+          assert.match(error.message, /symlink/, `the refusal must say the file is a link: ${path}`)
+          assert.match(error.message, /cannot be patched safely this run/, `the refusal must say why: ${path}`)
+          return true
+        },
+      )
+    }
+    // A refused read writes nothing: the link survives and the target is unchanged.
+    assert.equal((await lstat(link)).isSymbolicLink(), true, 'the refused read must not sever the link')
+    assert.equal(await readFile(externalFile, 'utf8'), text, 'the external target must be untouched')
+    // The two refusals spent no budget: a regular library skill still reads.
+    const normal = await writeSkill(home, 'normal-skill', 'body v1')
+    const value = await tool.execute({ path: normal.file }, {})
+    assert.equal(value.sha256, sha256(normal.text), 'a refused linked read must not spend a read')
+  })
+})
+
 // ── registration and the round trip through the review runner ────────────
 
 test('the review agent sees exactly one tool, registered through its own setup scope', async () => {
   await withHome(async () => {
     const host = fakeHost({ suggestions: [] })
     assert.equal(host.tools.registered.length, 0, 'applying the plugin must register no global tool; a normal agent is unchanged')
+    // The fake's inherited layer is what a normal scope starts with. With no
+    // restriction yet, that is all this scope sees.
+    assert.deepEqual(
+      host.tools.schemas().map((schema) => schema.name),
+      ['inherited_tool'],
+      'the inherited sentinel is visible before the review scope restricts it',
+    )
 
     host.start(liveSession('session-visible'))
     assert.ok(await waitFor(() => host.created.length === 1), 'the review agent must be created')
@@ -350,7 +429,12 @@ test('the review agent sees exactly one tool, registered through its own setup s
     assert.deepEqual(
       host.tools.schemas().map((schema) => schema.name),
       [TOOL],
-      'the review agent visible tool set is exactly the read tool',
+      'the empty allow-list masks the inherited tool; the scoped registration is the only visible tool',
+    )
+    assert.deepEqual(
+      host.tools.siblingSchemas().map((schema) => schema.name),
+      ['inherited_tool'],
+      'a normal agent scope still sees the inherited tool and never the review registration',
     )
     // The schema the model receives carries all three definition fields.
     const [visible] = host.tools.schemas()

@@ -346,12 +346,39 @@ function fakeServices(conclusionText, { suggestions } = {}) {
   // `tools` is present because `setup` registers the review agent's one tool and
   // restricts its inherited allow-list. `schemas()` models the visible set: a
   // scoped restriction never hides the scope's own registrations (dsh-tools view()).
+  // The inherited layer the host hands every scope, and the two-step view the
+  // host builds (dsh-tools registry `view()`): restrictions mask inherited names,
+  // then the scope's own registrations are added unconditionally. Without this
+  // layer the visible-set assertion could not fail if the restriction broke.
+  const inherited = new Map([
+    ['inherited_tool', { name: 'inherited_tool', description: 'a tool every normal agent inherits', parameters: { type: 'object', properties: {} } }],
+  ])
   const registered = []
   const restrictions = []
+  const visibleInherited = () => {
+    const names = new Set(inherited.keys())
+    for (const filter of restrictions) {
+      if (filter === undefined || filter === null) continue
+      for (const name of [...names]) {
+        const allowed = filter.allow === undefined
+          || (Array.isArray(filter.allow) && filter.allow.includes(name))
+        const denied = Array.isArray(filter.deny) && filter.deny.includes(name)
+        if (!allowed || denied) names.delete(name)
+      }
+    }
+    return [...names].map((name) => inherited.get(name))
+  }
   const tools = {
     register(definition) { registered.push(definition); return () => {} },
     restrict(filter) { restrictions.push(filter); return () => {} },
-    schemas() { return registered.map(({ name, description, parameters }) => ({ name, description, parameters })) },
+    schemas() {
+      const visible = new Map(visibleInherited().map((definition) => [definition.name, definition]))
+      for (const definition of registered) visible.set(definition.name, definition)
+      return [...visible.values()].map(({ name, description, parameters }) => ({ name, description, parameters }))
+    },
+    siblingSchemas() {
+      return [...inherited.values()].map(({ name, description, parameters }) => ({ name, description, parameters }))
+    },
   }
   const agentCtx = {
     get: () => undefined,
@@ -459,10 +486,12 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
     assert.equal(createOpts.meta.agentPreset, 'standard')
     assert.match(createOpts.meta.cwd, /hermes-loop-home-/)
     // Registration is proven on the visible set, not on the call: the inherited
-    // allow-list is empty and the scoped read tool is still what the model sees.
+    // allow-list masks the inherited tool and the scoped read tool is still what
+    // the model sees. A sibling scope keeps the inherited tool.
     assert.deepEqual(services.restrictions, [{ allow: [] }], 'the inherited allow-list stays empty')
     assert.deepEqual(services.registered.map((definition) => definition.name), ['read_skill_file'])
-    assert.deepEqual(services.tools.schemas().map((schema) => schema.name), ['read_skill_file'], 'one visible tool')
+    assert.deepEqual(services.tools.schemas().map((schema) => schema.name), ['read_skill_file'], 'one visible tool; the inherited tool is masked')
+    assert.deepEqual(services.tools.siblingSchemas().map((schema) => schema.name), ['inherited_tool'], 'a normal agent still sees the inherited tool')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome

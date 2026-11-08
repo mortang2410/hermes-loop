@@ -645,13 +645,14 @@ const REVIEW_READ_TOOL_TEXT = {
   description: 'Read one skill file from the global skill library and return its exact text plus the SHA-256 of that text. Pass the path from the suggestion block\'s [read: ...] marker on a skill\'s line. At most three successful reads per review; a file over the patchable ceiling is refused at read time, because it cannot be patched this run.',
   pathRequired: 'read_skill_file takes one argument, "path": the SKILL.md path shown by a suggestion block, of the form <skills>/<name>/SKILL.md.',
   refused: (target) => `read_skill_file reads only a global skill library file: a <library>/<name>/SKILL.md entry or the file that entry links to; ${JSON.stringify(target)} is neither, so nothing was read.`,
+  linked: (entry) => `read_skill_file refuses ${JSON.stringify(entry)}: its SKILL.md is a symlink, and the writer replaces SKILL.md by rename, so a patch would sever the link and leave the file it points at unchanged; it cannot be patched safely this run.`,
   unreadable: (target, code) => `read_skill_file could not read ${JSON.stringify(target)}${typeof code === 'string' ? ` (${code})` : ''}.`,
   tooLarge: (target, chars) => `${JSON.stringify(target)} is ${chars} characters, over the ${PATCHABLE_BODY_MAX_CHARS}-character patchable ceiling; it cannot be patched this run, so it was not read.`,
   budgetSpent: `The read budget is spent: a review gets at most ${REVIEW_SKILL_READ_MAX} successful skill reads, and this one has used all of them.`,
 }
 
 /**
- * True when `target` is the file a global-library skill points at.
+ * The library entry path whose SKILL.md `target` names, or undefined.
  *
  * The lexical shape is `<library>/<name>/SKILL.md`; expressed on the relative path
  * so a prefix sibling (`<library>-archive/x/SKILL.md` resolves to `../...`) and a
@@ -661,21 +662,26 @@ const REVIEW_READ_TOOL_TEXT = {
  * still patches that skill by entry name and hashes the same bytes, so an entry's
  * target is a legal read. Any file no entry points at (a project skill, an
  * arbitrary path) is refused.
+ *
+ * Returns the ENTRY path (`<library>/<name>/SKILL.md`), not the requested one, so
+ * the caller can inspect the entry itself: an entry whose SKILL.md is a symlink
+ * is refused there, because the writer's rename would replace the link.
  */
-async function isLibrarySkillFile(libraryRoot, target) {
+async function libraryEntryFor(libraryRoot, target) {
   const parts = relative(libraryRoot, target).split(sep)
-  if (parts.length === 2 && parts[1] === 'SKILL.md' && parts[0] !== '' && parts[0] !== '.' && parts[0] !== '..') return true
-  if (target.slice(-'SKILL.md'.length) !== 'SKILL.md') return false
+  if (parts.length === 2 && parts[1] === 'SKILL.md' && parts[0] !== '' && parts[0] !== '.' && parts[0] !== '..') return target
+  if (target.slice(-'SKILL.md'.length) !== 'SKILL.md') return undefined
   let realTarget
-  try { realTarget = await fsP.realpath(target) } catch { return false }
+  try { realTarget = await fsP.realpath(target) } catch { return undefined }
   let entries
-  try { entries = await fsP.readdir(libraryRoot) } catch { return false }
+  try { entries = await fsP.readdir(libraryRoot) } catch { return undefined }
   for (const entry of entries) {
     try {
-      if (await fsP.realpath(join(libraryRoot, entry, 'SKILL.md')) === realTarget) return true
+      const candidate = join(libraryRoot, entry, 'SKILL.md')
+      if (await fsP.realpath(candidate) === realTarget) return candidate
     } catch { /* not a directory-shaped skill entry */ }
   }
-  return false
+  return undefined
 }
 
 /**
@@ -685,11 +691,12 @@ async function isLibrarySkillFile(libraryRoot, target) {
  * is the `baseHash` the writer compares before a patch. Three successful reads
  * per review; a refused read does not spend one. Reads are limited to the global
  * library because the writer only ever patches a global skill, so a hash from a
- * project skill could never satisfy its conflict check; a library entry that
- * links out of the library is read through its target, which is the same file the
- * writer patches by entry name. The size ceiling is the writer's own
- * `PATCHABLE_BODY_MAX_CHARS` check, mirrored exactly, so a file this tool returns
- * is always one the writer will rewrite.
+ * project skill could never satisfy its conflict check; a library entry that is a
+ * symlinked directory is read through its target, which is the same file the
+ * writer patches by entry name, while a SKILL.md that is itself a symlink is
+ * refused (the writer's rename would replace the link). The size ceiling is the
+ * writer's own `PATCHABLE_BODY_MAX_CHARS` check, mirrored exactly, so a file this
+ * tool returns is always one the writer will rewrite.
  *
  * @param {object} [opts]
  * @param {string} [opts.root] Skill library root; defaults to `globalSkillsDir()`.
@@ -736,8 +743,18 @@ function buildReviewSkillReadTool({ root = globalSkillsDir(), budget = REVIEW_SK
       const target = resolve(requested)
       // One guard for the whole restriction: the target must be a global skill's
       // SKILL.md, either inside the library or the file its entry links to.
-      if (!await isLibrarySkillFile(libraryRoot, target)) {
+      const entry = await libraryEntryFor(libraryRoot, target)
+      if (entry === undefined) {
         throw new Error(REVIEW_READ_TOOL_TEXT.refused(target))
+      }
+      // lstat reads the final component without following it: a directory-symlinked
+      // entry still shows its SKILL.md as a regular file, but a SKILL.md that is
+      // itself a link is refused before it can spend a read (the writer's rename
+      // would replace the link and leave its target stale).
+      let entryStat
+      try { entryStat = await fsP.lstat(entry) } catch { /* readFile below reports it */ }
+      if (entryStat !== undefined && entryStat.isSymbolicLink()) {
+        throw new Error(REVIEW_READ_TOOL_TEXT.linked(entry))
       }
       let text
       try {
