@@ -342,7 +342,19 @@ test('a manual review for the same session cancels the pending retry', async (t)
   t.mock.timers.enable({ apis: ['setTimeout'] })
   await withHome(async () => {
     let calls = 0
-    const host = fakeHost({ suggestionService: { query: async () => { calls++; return { suggestions: [], rendered: '', degraded: true, reason: 'judge-timeout' } } } })
+    const host = fakeHost({
+      suggestionService: {
+        query: async () => {
+          calls += 1
+          // The first answer defers and schedules the retry. The manual review
+          // then answers healthy, so only the entry-time cancelRetry can stop the
+          // old timer; a second deferral would replace it through scheduleRetry.
+          return calls === 1
+            ? { suggestions: [], rendered: '', degraded: true, reason: 'judge-timeout' }
+            : healthyEmpty()
+        },
+      },
+    })
     host.start()
     const live = session('session-cancel')
     host.sessions.set(live.id, live)
@@ -358,11 +370,50 @@ test('a manual review for the same session cancels the pending retry', async (t)
     assert.equal(res.status, 202, 'the manual review must start')
     await flush()
     assert.equal(calls, 2, 'the manual review ran despite the pending retry')
-    assert.equal((await statusOf(host, live.id)).deferredCount, 1, 'only one retry may be pending')
+    assert.equal((await statusOf(host, live.id)).deferredCount, 0, 'a healthy manual review leaves no retry pending')
 
     t.mock.timers.tick(HOUR_MS)
     await flush()
-    assert.equal(calls, 3, 'only the retry scheduled by the manual review may fire')
+    assert.equal(calls, 2, 'the cancelled retry must not fire at the hour')
+  })
+})
+
+test('a threshold crossed while the first query is pending does not bypass the retry delay', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  await withHome(async (home) => {
+    let calls = 0
+    let releaseFirst
+    const host = fakeHost({
+      suggestionService: {
+        query: () => {
+          calls += 1
+          if (calls === 1) return new Promise((resolve) => { releaseFirst = resolve })
+          return Promise.resolve(healthyEmpty())
+        },
+      },
+    })
+    host.start()
+    const live = session('session-queued-during-query')
+    host.sessions.set(live.id, live)
+
+    host.fire(live, completedTurn)
+    assert.ok(await waitFor(() => typeof releaseFirst === 'function'), 'the first query must be pending')
+
+    // The threshold is crossed again while that query is in flight. No retry
+    // exists yet, so the gate cannot see one and the trigger path queues an
+    // automatic review behind the running one.
+    host.fire(live, completedTurn)
+    releaseFirst({ suggestions: [], rendered: '', degraded: true, reason: 'judge-timeout' })
+    await flush()
+
+    assert.equal(calls, 1, 'the queued automatic review must not query before the retry deadline')
+    assert.equal((await ledger(home)).filter((e) => e.event === 'review-start').length, 1, 'no second review may start')
+    assert.equal((await statusOf(host, live.id)).deferredCount, 1, 'the deferral still owns the one retry')
+
+    // The dropped queue entry must not have taken the retry with it.
+    t.mock.timers.tick(HOUR_MS)
+    await flush()
+    assert.equal(calls, 2, 'the retry itself must still run at the deadline')
   })
 })
 

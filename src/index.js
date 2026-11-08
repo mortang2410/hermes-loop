@@ -1770,11 +1770,11 @@ module.exports = {
 
     const drainNext = () => {
       if (running !== null || queued.size === 0) return
-      const [nextSessionId, task] = queued.entries().next().value
+      const [nextSessionId, entry] = queued.entries().next().value
       queued.delete(nextSessionId)
       // 直接同步调用：running 必须在同一调用栈内置位。隔一个微任务会让并发的
       // 下一个事件也看到 running===null，串行不变量被击穿
-      task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
+      entry.task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
     }
 
     // ── Deferred-review retries ───────────────────────────────────────────────
@@ -1819,7 +1819,7 @@ module.exports = {
         }
         const task = () => runReview({ session: live, eff: retryEff })
         if (running === null) task().catch((e) => ctx.logger.warn(`hermes-loop: retry review: ${e && e.message}`))
-        else queued.set(sessionId, task) // the session queue: a newer task replaces this one
+        else queued.set(sessionId, { task, manual: false }) // the session queue: a newer task replaces this one
       }, REVIEW_RETRY_DELAY_MS)
       if (typeof timer.unref === 'function') timer.unref()
       retries.set(sessionId, { timer, reason, retryAt })
@@ -1888,6 +1888,13 @@ module.exports = {
           st.failures += windowBefore.failures
           if (st.signal === undefined) st.signal = windowBefore.signal
           st.lastReviewAt = windowBefore.lastReviewAt
+          // A threshold crossed while this query was pending queued an automatic
+          // review. It would start as soon as the runner drains, cancel the retry
+          // below, and query the router again inside the retry hour. Drop it; the
+          // retry covers the same work on fresher state. A queued manual request
+          // is the user's explicit ask and stays.
+          const queuedEntry = queued.get(sessionId)
+          if (queuedEntry !== undefined && queuedEntry.manual !== true) queued.delete(sessionId)
           trace('review-deferred', { sessionId, manual, reason: suggestion.reason, detail: suggestion.detail })
           ctx.logger.warn(`hermes-loop: review for session ${sessionId} deferred (${suggestion.reason}); no prompt sent, one retry in ${Math.round(REVIEW_RETRY_DELAY_MS / 60000)} minutes`)
           scheduleRetry(sessionId, suggestion.reason)
@@ -2129,8 +2136,8 @@ module.exports = {
 
         if (event.type === 'turn/start') {
           // 前台优先：本 session 的排队任务直接丢弃；运行中的靠 cancel
-          const queuedTask = queued.get(sessionId)
-          if (queuedTask !== undefined) { queued.delete(sessionId); ctx.logger.info(`hermes-loop: dropped queued review for session ${sessionId} (new turn started)`) }
+          const queuedEntry = queued.get(sessionId)
+          if (queuedEntry !== undefined) { queued.delete(sessionId); ctx.logger.info(`hermes-loop: dropped queued review for session ${sessionId} (new turn started)`) }
           if (running !== null && running.sessionId === sessionId) running.controller.abort()
           return
         }
@@ -2224,10 +2231,10 @@ module.exports = {
         if (running === null) {
           // 同步直调（running 立即置位），不隔微任务
           task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
-        } else if (!queued.has(sessionId)) {
-          queued.set(sessionId, task)
         } else {
-          queued.set(sessionId, task) // 同 session 重触发 → 新任务顶替旧排队
+          // 同 session 重触发 → 新任务顶替旧排队。An automatic entry is not
+          // manual, so a deferral can drop it and let its retry cover the work.
+          queued.set(sessionId, { task, manual: false })
         }
       } catch (e) { ctx.logger.warn(`hermes-loop: session/event handler: ${e && e.message}`) }
     }
@@ -2545,7 +2552,7 @@ module.exports = {
                 if (!wasRunning) {
                   task().catch((e) => ctx.logger.warn(`hermes-loop: manual review: ${e && e.message}`)) // 同步直调置 running
                 } else {
-                  queued.set(sessionId, task) // 排队（顶替同 session 旧任务），running 结束后 drainNext
+                  queued.set(sessionId, { task, manual: true }) // 排队（顶替同 session 旧任务），running 结束后 drainNext
                 }
                 trace('manual-review-requested', { sessionId, queued: wasRunning })
                 sendJson(res, 202, { ok: true, state: wasRunning ? 'queued' : 'started' })
