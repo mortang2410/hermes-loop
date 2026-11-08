@@ -9,6 +9,8 @@
 > 因此触发方案从"主 agent 自报端点"升级为**与 Hermes 同构的 session/event 订阅**，prompt 自报降级为兜底。
 >
 > **v2.1 修订说明（2026-08-28 设计评审）**：① suspects 全文注入在 §2/§4.1/§6 三处对齐；② hermes-prompt 补 `ctx.provide('hermesPrompt')` 服务标记，探测由不可行的"隐式探测"改为 `ctx.get('hermesPrompt', false)`；③ 输出协议补 `baseHash`/`baseDescription` 字段，read-before-write 升级为两步（CAS + 原子 rename）；④ pending 路径对齐 `DSH_HOME`；⑤ 补 log-only 模式行为、生命周期清理、abort 链路伪代码、触发计数语义、skills-management rank 脚注。
+>
+> **Status of the shipped code, which this record predates:** the review input is the DSH skill router's suggestion block, not the skill catalog and keyword picker (kata j53y); the review agent runs with one scoped tool that reads a suggested skill file and returns its SHA-256 (kata d3ek); reviews run on the local `strata/qwen-strata` alias (kata 041x). Sections below that describe catalog or suspect injection, or a zero-tool review agent, are the original design and no longer match the live path.
 
 ## 0. 对等性结论：能，且保真度比 v1 方案高
 
