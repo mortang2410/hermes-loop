@@ -401,6 +401,37 @@ test('a SKILL.md that is itself a symlink is refused and the link and target are
   })
 })
 
+test('a failing entry inspection refuses before any read and spends no budget', async () => {
+  await withHome(async (home) => {
+    const skill = await writeSkill(home, 'alpha-skill', 'body v1')
+    const tool = I.buildReviewSkillReadTool()
+    // The plugin holds the same module object (`const fsP = require('node:fs/promises')`),
+    // so patching it here makes only the entry lstat fail; the target stays readable.
+    const fsP = createRequire(import.meta.url)('node:fs/promises')
+    const realLstat = fsP.lstat
+    fsP.lstat = async () => { throw Object.assign(new Error('injected EIO'), { code: 'EIO' }) }
+    try {
+      await assert.rejects(
+        () => tool.execute({ path: skill.file }, {}),
+        (error) => {
+          assert.match(error.message, /could not read/, 'the refusal must say the entry could not be inspected')
+          assert.match(error.message, /EIO/, 'the refusal must carry the failure reason')
+          assert.ok(error.message.includes(skill.file), 'the refusal must name the entry path')
+          return true
+        },
+      )
+    } finally {
+      fsP.lstat = realLstat
+    }
+    // The refused inspection spent no budget: the full three reads still succeed,
+    // and the target was readable the whole time the lstat failed.
+    for (let read = 1; read <= 3; read++) {
+      const value = await tool.execute({ path: skill.file }, {})
+      assert.equal(value.sha256, sha256(skill.text), `read ${read} after the refused inspection`)
+    }
+  })
+})
+
 // ── registration and the round trip through the review runner ────────────
 
 test('the review agent sees exactly one tool, registered through its own setup scope', async () => {

@@ -750,10 +750,16 @@ function buildReviewSkillReadTool({ root = globalSkillsDir(), budget = REVIEW_SK
       // lstat reads the final component without following it: a directory-symlinked
       // entry still shows its SKILL.md as a regular file, but a SKILL.md that is
       // itself a link is refused before it can spend a read (the writer's rename
-      // would replace the link and leave its target stale).
+      // would replace the link and leave its target stale). A failed inspection
+      // refuses too: the requested target can stay readable, and a read would then
+      // return a hash the writer's entry-path patch cannot match safely.
       let entryStat
-      try { entryStat = await fsP.lstat(entry) } catch { /* readFile below reports it */ }
-      if (entryStat !== undefined && entryStat.isSymbolicLink()) {
+      try {
+        entryStat = await fsP.lstat(entry)
+      } catch (e) {
+        throw new Error(REVIEW_READ_TOOL_TEXT.unreadable(entry, e && e.code))
+      }
+      if (entryStat.isSymbolicLink()) {
         throw new Error(REVIEW_READ_TOOL_TEXT.linked(entry))
       }
       let text
