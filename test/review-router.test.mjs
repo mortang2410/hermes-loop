@@ -26,11 +26,13 @@ const SUGGESTIONS = [
   { name: 'alpha-skill', description: 'first suggested skill', path: '/skills/alpha-skill/SKILL.md' },
   { name: 'beta-skill', description: 'second suggested skill' },
 ]
-// Exactly what the router's renderer produces for SUGGESTIONS: a caller must
-// not reformat it, so the fixture is a literal, not a re-render.
+// Exactly what the router's renderer produces for SUGGESTIONS: the route is
+// appended to the skill's own line as `[read: ...]`, and a caller must not
+// reformat it, so the fixture is a literal, not a re-render. Verified against
+// the router's own renderer (`renderSuggestions` + `routeOf` in
+// dsh-skill-router/src/selection/suggestion-selector.ts) and its tests.
 const RENDERED = [
-  '- alpha-skill: first suggested skill',
-  '  read: /skills/alpha-skill/SKILL.md',
+  '- alpha-skill: first suggested skill [read: /skills/alpha-skill/SKILL.md]',
   '- beta-skill: second suggested skill',
 ].join('\n')
 
@@ -77,7 +79,7 @@ function fakeHost({ suggestionService, catalog = [], conclusion = '{"action":"no
     agents: {
       create: async (opts) => {
         created.push(opts)
-        if (typeof opts.setup === 'function') await opts.setup({ tools: { restrict() {} }, get: () => undefined }, agent)
+        if (typeof opts.setup === 'function') await opts.setup({ tools: { register() {}, restrict() {} }, get: () => undefined }, agent)
         return { agent, dispose: async () => {} }
       },
       get: () => undefined,

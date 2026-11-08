@@ -486,7 +486,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '1. The user corrected style/tone/format/verbosity ("stop doing X" / "too verbose" / "just give me the answer") — this is a FIRST-CLASS signal;',
     '2. The user corrected the workflow or the order of steps;',
     '3. A non-trivial technique, fix, workaround, debugging path, or tool usage appeared;',
-    '4. An existing skill listed in the suggestion block was found wrong, incomplete, or outdated → name it in the rationale; this round cannot edit it.',
+    '4. An existing skill listed in the suggestion block was found wrong, incomplete, or outdated → read it with read_skill_file, then patch it with the hash the read returned; if the read is refused or the file is over the ceiling, name it in the rationale and answer nothing.',
     '',
     '## Negative list (never distill these)',
     '- Environment dependency failures (missing binary, unconfigured credentials — things the user can fix themselves);',
@@ -496,8 +496,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
     '',
     '## Priority order',
-    'The suggestion block is the only skill list this round; this round has no read tool, so it cannot read any skill file and cannot change any existing skill.',
-    '1. A skill in the suggestion block already covers the finding: it cannot be patched this round (no read tool, so no baseHash), so name it in the rationale and answer nothing;',
+    'The suggestion block is the only skill list this round and the only source of skill files you may read; a review may read at most three of its skill files successfully, and the fourth is refused.',
+    '1. A skill in the suggestion block already covers the finding: read the bracketed route at the end of its line with read_skill_file, rewrite the body from the text it returned, and put the returned hash in baseHash to patch it; if the read is refused or the file is over the ceiling, name the skill in the rationale and answer nothing;',
     '2. No skill in the suggestion block can carry the finding → CREATE a new skill; a skill outside the block never counts as coverage.',
     '',
     '## Naming discipline',
@@ -506,8 +506,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '',
     '## Layout: topic skills and reference files',
     'The skill router indexes only the name and the first 400 characters of each skill\'s description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.',
-    '- This round has no read tool, so no existing skill and no existing reference file can be changed: an existing skill cannot be patched, and an existing reference file cannot be edited;',
-    '- The finding is a sub-topic of an existing topic skill (visible in the suggestion block) → this round cannot write it; name that skill in the rationale and answer nothing;',
+    '- An existing skill may be patched: read it with read_skill_file first, rewrite the body from the text it returned, and use the returned hash as baseHash; an existing reference file still cannot be edited this round;',
+    '- The finding is a sub-topic of an existing topic skill (visible in the suggestion block) → read that skill, fold the new experience into its body, and patch it;',
     '- A genuinely new broad topic that no skill in the suggestion block can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
     '- On CREATE, files may carry new reference files: at most 8 entries, each at most 32768 characters, with paths only of the form references/<kebab-name>.md; new files only, and never a baseHash.',
     'The optional files field of the output JSON, for create only:',
@@ -531,8 +531,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '  "skill": "kebab-case-name",            // required for create/patch',
     '  "description": "≤500 characters",       // required for create',
     '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
-    '  "baseHash": "<SHA-256 of the SKILL.md text>",  // required for patch; this round has no read tool, so do not emit it',
-    '  "baseDescription": "<the description field of the SKILL.md>",  // required for patch; this round has no read tool, so do not emit it',
+    '  "baseHash": "<SHA-256 returned by read_skill_file>",  // required for patch; must come from a read in this same review',
+    '  "baseDescription": "<the description field of the SKILL.md you read>",  // required for patch; taken from the same read',
     '  "rationale": "One sentence: why it is worth storing, or why not",',
     '  "memory": {                            // optional; most reviews should omit the whole field',
     '    "action": "nothing" | "add" | "replace" | "remove",',
@@ -542,7 +542,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '    "rationale": "Why record / change / delete" }',
     '}',
     '```',
-    'A patch needs a read tool to derive the body from the target text; this round has no read tool, so do not emit a patch.',
+    'A patch must be built from the text and hash read_skill_file returned; never emit a patch for a file you did not read.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
     'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript or memory entries happen to use.',
   ], 'the English review prompt changed')
@@ -570,44 +570,51 @@ test('the review prompt teaches the topic-skill / reference split in both langua
   assert.match(en, /only the name and the first 400 characters/)
 })
 
-test('the review prompt limits this round to the suggestion block and new skills', () => {
-  // This round has no read tool (d3ek adds one). A prompt that tells the model to
-  // read a file, patch an existing skill, or extend a reference file describes a
-  // different round: the model cannot produce the baseHash those actions need, so
-  // the contradiction turns into an unsupported patch or a claim that an unlisted
-  // skill already covers the finding.
-  const forbidden = {
-    zh: [
-      '要改某个 skill 就先读它的文件',
-      '建议块之外，若某个既有 class-level umbrella skill',
-      '写入该 skill 的 references/',
-      '只改 SKILL.md 正文',
-      '读文件工具返回的 SHA-256',
-      '读到的 SKILL.md 全文',
-      '回到优先序 1/2 去扩写既有 skill',
-    ],
-    en: [
-      'to change a skill you read its file',
-      'A class-level umbrella skill outside the block',
-      'write it to references/<kebab-name>.md of that skill',
-      'edit the SKILL.md body only',
-      'the SHA-256 the read tool returned',
-      'SHA-256 of the SKILL.md text you read',
-      'go back to priority 1/2 and extend an existing skill',
-    ],
+test('the review prompt sends the reviewer to its read tool for a patch, only for suggested files', () => {
+  // d3ek gives the review agent one read tool. The prompt must describe exactly
+  // that capability: read a suggested file (up to three), patch with the hash the
+  // same read returned, and never claim a skill can be patched without a read.
+  // The create path is unchanged: a new skill still needs no read, and the
+  // block stays the only skill list the review may act on.
+  const stale = {
+    zh: ['本轮没有读文件工具', '没有读文件工具，拿不到 baseHash', '本轮写不进去'],
+    en: ['this round has no read tool', 'no read tool, so no baseHash', 'this round cannot write it'],
   }
   const required = {
-    zh: ['建议块是本轮唯一的 skill 清单', '本轮没有读文件工具', '建议块之外的 skill 一律不算覆盖', 'CREATE 新 skill'],
-    en: ['The suggestion block is the only skill list this round', 'this round has no read tool', 'a skill outside the block never counts as coverage', 'CREATE a new skill'],
+    zh: [
+      '建议块是本轮唯一的 skill 清单',
+      '建议块之外的 skill 一律不算覆盖',
+      'read_skill_file',
+      '最多成功读取 3 个',
+      '把返回的哈希写进 baseHash',
+      'CREATE 新 skill',
+    ],
+    en: [
+      'The suggestion block is the only skill list this round',
+      'a skill outside the block never counts as coverage',
+      'read_skill_file',
+      'at most three',
+      'put the returned hash in baseHash',
+      'CREATE a new skill',
+    ],
   }
   for (const lang of ['zh', 'en']) {
     const prompt = I.reviewPrompt({ memoryEnabled: true, userProfileEnabled: true }, lang)
-    for (const phrase of forbidden[lang]) {
-      assert.ok(!prompt.includes(phrase), `${lang}: the prompt still describes a read-tool workflow: ${phrase}`)
+    for (const phrase of stale[lang]) {
+      assert.ok(!prompt.includes(phrase), `${lang}: the prompt still describes a no-read-tool round: ${phrase}`)
     }
     for (const phrase of required[lang]) {
-      assert.ok(prompt.includes(phrase), `${lang}: the prompt is missing its no-read-tool rule: ${phrase}`)
+      assert.ok(prompt.includes(phrase), `${lang}: the prompt is missing its read-tool rule: ${phrase}`)
     }
+    // The patch contract is spelled out where the model fills it in: a baseHash
+    // must come from a read in this same review, never from anywhere else.
+    assert.ok(
+      prompt.includes(lang === 'en'
+        ? 'must come from a read in this same review'
+        : '只能来自本轮的一次读取'),
+      `${lang}: the baseHash field must name the read as its only source`,
+    )
+    assert.match(prompt, /CREATE/, `${lang}: the create path must stay intact`)
   }
   // The per-file baseHash echo is gone: files may only carry new files, so there
   // is no existing file whose hash the review could echo.
@@ -937,8 +944,8 @@ test('the zh review layout block is pinned to a test-owned literal', () => {
   assert.deepEqual(I.REVIEW_LAYOUT_TEXT.zh, [
     '## 布局：topic skill 与 reference 文件',
     '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
-    '- 本轮没有读文件工具，任何已存在的 skill 和 reference 文件都不可修改：不能 patch 已有 skill，也不能改已有 reference 文件；',
-    '- 经验属于某个既有 topic skill 的子主题（建议块里能看出）→ 本轮写不进去；把该 skill 名写进 rationale，结论用 nothing；',
+    '- 已有 skill 可以 patch：先用 read_skill_file 读它，用返回的全文改写正文，用返回的哈希作 baseHash；已有的 reference 文件本轮仍不可改；',
+    '- 经验属于某个既有 topic skill 的子主题（建议块里能看出）→ 读该 skill，把新经验并入它的正文再 patch；',
     '- 确实是新的宽主题，且建议块里没有任何 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
     '- CREATE 时可在 files 里附带新建的 reference 文件：最多 8 个，每个不超过 32768 字符，路径只能是 references/<kebab-name>.md；只能放新建文件，不要提供 baseHash。',
     '输出 JSON 中可选的 files 字段（仅 create 使用）：',

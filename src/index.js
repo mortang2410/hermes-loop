@@ -4,9 +4,11 @@
  * dsh-plugin-hermes-loop — Hermes-style learning loop, host half.
  *
  * Subscribes to every session's `session/event` stream, counts completed
- * turns / tool calls per session, and when a threshold fires runs a
- * zero-tool background review agent over the transcript tail. The review
- * returns a fenced-JSON conclusion {action: nothing|create|patch, ...} with
+ * turns / tool calls per session, and when a threshold fires runs a background
+ * review agent over the transcript tail. That agent has one tool: a skill-file
+ * read that returns the file text and its SHA-256, three successful reads per
+ * review. The review returns a fenced-JSON conclusion
+ * {action: nothing|create|patch, ...} with
  * an optional on-demand `memory` sub-conclusion, and this plugin (never the
  * agent) writes the skill / memory entries to disk. Memory is injected back
  * through `systemPrompt.context()` — the delta-projected runtime snapshot.
@@ -19,7 +21,7 @@
 const { createHash, randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
 const fs = require('node:fs')
-const { join, resolve, sep } = require('node:path')
+const { join, resolve, relative, sep } = require('node:path')
 const { homedir } = require('node:os')
 // settings 服务要求 schemastery schema（需要可调用校验 + toJSON，zod 不兼容）。
 // 不能依赖打包依赖：宿主沙箱 require 解析 .pnpm 软链邻居时抛 ERR_INTERNAL_ASSERTION。
@@ -626,6 +628,134 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
   return { result: 'patched', path: targetFile, at: now, files }
 }
 
+// ── The review agent's one tool (d3ek) ──────────────────────────────────
+//
+// The review agent inherits an empty allow-list (`restrict({ allow: [] })`) and
+// gets exactly this tool, registered into its own scope. A restriction filters
+// only what a scope INHERITS; the scope's own registrations stay visible
+// (dsh-tools registry `view()`), which is what leaves that one agent with one
+// tool while every normal agent keeps its full set. The definition is built
+// literally, as the memory plugin builds its host-plane tools: the tools
+// package is the host's, not a dependency of this plugin.
+const REVIEW_SKILL_READ_TOOL = 'read_skill_file'
+// Three successful reads per review. The counter lives in the tool's own
+// closure, built once per review run, so two reviews cannot share a budget.
+const REVIEW_SKILL_READ_MAX = 3
+const REVIEW_READ_TOOL_TEXT = {
+  description: 'Read one skill file from the global skill library and return its exact text plus the SHA-256 of that text. Pass the path from the suggestion block\'s [read: ...] marker on a skill\'s line. At most three successful reads per review; a file over the patchable ceiling is refused at read time, because it cannot be patched this run.',
+  pathRequired: 'read_skill_file takes one argument, "path": the SKILL.md path shown by a suggestion block, of the form <skills>/<name>/SKILL.md.',
+  refused: (target) => `read_skill_file reads only a global skill library file: a <library>/<name>/SKILL.md entry or the file that entry links to; ${JSON.stringify(target)} is neither, so nothing was read.`,
+  unreadable: (target, code) => `read_skill_file could not read ${JSON.stringify(target)}${typeof code === 'string' ? ` (${code})` : ''}.`,
+  tooLarge: (target, chars) => `${JSON.stringify(target)} is ${chars} characters, over the ${PATCHABLE_BODY_MAX_CHARS}-character patchable ceiling; it cannot be patched this run, so it was not read.`,
+  budgetSpent: `The read budget is spent: a review gets at most ${REVIEW_SKILL_READ_MAX} successful skill reads, and this one has used all of them.`,
+}
+
+/**
+ * True when `target` is the file a global-library skill points at.
+ *
+ * The lexical shape is `<library>/<name>/SKILL.md`; expressed on the relative path
+ * so a prefix sibling (`<library>-archive/x/SKILL.md` resolves to `../...`) and a
+ * `..` traversal both fail. A library entry may also be a symlink: this machine
+ * links 87 of its 90 global skills into dotfiles, and the skill catalog reports
+ * each entry's REALPATH, so a suggestion block names the dotfiles file. The writer
+ * still patches that skill by entry name and hashes the same bytes, so an entry's
+ * target is a legal read. Any file no entry points at (a project skill, an
+ * arbitrary path) is refused.
+ */
+async function isLibrarySkillFile(libraryRoot, target) {
+  const parts = relative(libraryRoot, target).split(sep)
+  if (parts.length === 2 && parts[1] === 'SKILL.md' && parts[0] !== '' && parts[0] !== '.' && parts[0] !== '..') return true
+  if (target.slice(-'SKILL.md'.length) !== 'SKILL.md') return false
+  let realTarget
+  try { realTarget = await fsP.realpath(target) } catch { return false }
+  let entries
+  try { entries = await fsP.readdir(libraryRoot) } catch { return false }
+  for (const entry of entries) {
+    try {
+      if (await fsP.realpath(join(libraryRoot, entry, 'SKILL.md')) === realTarget) return true
+    } catch { /* not a directory-shaped skill entry */ }
+  }
+  return false
+}
+
+/**
+ * Build the review agent's skill-file read, one definition per review run.
+ *
+ * The read returns the whole file text and the SHA-256 of that exact text, which
+ * is the `baseHash` the writer compares before a patch. Three successful reads
+ * per review; a refused read does not spend one. Reads are limited to the global
+ * library because the writer only ever patches a global skill, so a hash from a
+ * project skill could never satisfy its conflict check; a library entry that
+ * links out of the library is read through its target, which is the same file the
+ * writer patches by entry name. The size ceiling is the writer's own
+ * `PATCHABLE_BODY_MAX_CHARS` check, mirrored exactly, so a file this tool returns
+ * is always one the writer will rewrite.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.root] Skill library root; defaults to `globalSkillsDir()`.
+ * @param {number} [opts.budget] Successful reads allowed before the refusal.
+ * @returns {object} A literal ToolDefinition for `agentCtx.tools.register`.
+ */
+function buildReviewSkillReadTool({ root = globalSkillsDir(), budget = REVIEW_SKILL_READ_MAX } = {}) {
+  const libraryRoot = resolve(root)
+  let remaining = budget
+  return {
+    name: REVIEW_SKILL_READ_TOOL,
+    description: REVIEW_READ_TOOL_TEXT.description,
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Path of the SKILL.md to read: the path in the suggestion block\'s [read: ...] marker.',
+        },
+      },
+      required: ['path'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string' },
+          text: { type: 'string' },
+          sha256: { type: 'string' },
+        },
+        required: ['path', 'text', 'sha256'],
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `sha256: ${value.sha256}\npath: ${value.path}\n\n${value.text}`,
+      }],
+    },
+    async execute(args) {
+      if (remaining <= 0) throw new Error(REVIEW_READ_TOOL_TEXT.budgetSpent)
+      const requested = args && args.path
+      if (typeof requested !== 'string' || requested === '') throw new Error(REVIEW_READ_TOOL_TEXT.pathRequired)
+      const target = resolve(requested)
+      // One guard for the whole restriction: the target must be a global skill's
+      // SKILL.md, either inside the library or the file its entry links to.
+      if (!await isLibrarySkillFile(libraryRoot, target)) {
+        throw new Error(REVIEW_READ_TOOL_TEXT.refused(target))
+      }
+      let text
+      try {
+        text = await fsP.readFile(target, 'utf8')
+      } catch (e) {
+        throw new Error(REVIEW_READ_TOOL_TEXT.unreadable(target, e && e.code))
+      }
+      // The writer's guard is `current.length > PATCHABLE_BODY_MAX_CHARS`, so the
+      // same comparison here means a successful read is always patchable.
+      if (text.length > PATCHABLE_BODY_MAX_CHARS) {
+        throw new Error(REVIEW_READ_TOOL_TEXT.tooLarge(target, text.length))
+      }
+      remaining -= 1
+      return { path: target, text, sha256: sha256(text) }
+    },
+  }
+}
+
 /**
  * Plan the reference-file writes of one conclusion before any byte is written.
  * parseConclusion checks the same rules, but applyConclusion also runs on
@@ -1182,8 +1312,8 @@ const REVIEW_LAYOUT_TEXT = {
   zh: [
     '## 布局：topic skill 与 reference 文件',
     '路由器只为每个 skill 索引 name 与 description 的前 400 个字符，reference 文件从不被索引。所以 description 的前 400 字符必须写清触发场景。',
-    '- 本轮没有读文件工具，任何已存在的 skill 和 reference 文件都不可修改：不能 patch 已有 skill，也不能改已有 reference 文件；',
-    '- 经验属于某个既有 topic skill 的子主题（建议块里能看出）→ 本轮写不进去；把该 skill 名写进 rationale，结论用 nothing；',
+    '- 已有 skill 可以 patch：先用 read_skill_file 读它，用返回的全文改写正文，用返回的哈希作 baseHash；已有的 reference 文件本轮仍不可改；',
+    '- 经验属于某个既有 topic skill 的子主题（建议块里能看出）→ 读该 skill，把新经验并入它的正文再 patch；',
     '- 确实是新的宽主题，且建议块里没有任何 skill 能承载 → CREATE 新 skill。不要为子主题新建 skill；',
     `- CREATE 时可在 files 里附带新建的 reference 文件：最多 ${REFERENCE_FILES_MAX} 个，每个不超过 ${REFERENCE_FILE_MAX_CHARS} 字符，路径只能是 references/<kebab-name>.md；只能放新建文件，不要提供 baseHash。`,
     '输出 JSON 中可选的 files 字段（仅 create 使用）：',
@@ -1192,8 +1322,8 @@ const REVIEW_LAYOUT_TEXT = {
   en: [
     '## Layout: topic skills and reference files',
     'The skill router indexes only the name and the first 400 characters of each skill\'s description; reference files are never indexed. So the first 400 characters of a description must state the trigger situations.',
-    '- This round has no read tool, so no existing skill and no existing reference file can be changed: an existing skill cannot be patched, and an existing reference file cannot be edited;',
-    '- The finding is a sub-topic of an existing topic skill (visible in the suggestion block) → this round cannot write it; name that skill in the rationale and answer nothing;',
+    '- An existing skill may be patched: read it with read_skill_file first, rewrite the body from the text it returned, and use the returned hash as baseHash; an existing reference file still cannot be edited this round;',
+    '- The finding is a sub-topic of an existing topic skill (visible in the suggestion block) → read that skill, fold the new experience into its body, and patch it;',
     '- A genuinely new broad topic that no skill in the suggestion block can carry → CREATE a new skill. Never create a new skill for a sub-topic;',
     `- On CREATE, files may carry new reference files: at most ${REFERENCE_FILES_MAX} entries, each at most ${REFERENCE_FILE_MAX_CHARS} characters, with paths only of the form references/<kebab-name>.md; new files only, and never a baseHash.`,
     'The optional files field of the output JSON, for create only:',
@@ -1211,7 +1341,7 @@ const REVIEW_PROMPT_TEXT = {
     '1. 用户纠正了风格/语气/格式/冗长度（"stop doing X" / "too verbose" / "直接给答案"）——这是 FIRST-CLASS 信号；',
     '2. 用户纠正了工作流或步骤顺序；',
     '3. 出现非平凡的技巧、修复、绕过、调试路径、工具用法；',
-    '4. 建议块里列出的既有 skill 被发现有错/缺步/过时 → 在 rationale 里点名它；本轮没有读文件工具，改不了它。',
+    '4. 建议块里列出的既有 skill 被发现有错/缺步/过时 → 先用 read_skill_file 读它，再用返回的哈希 patch 它；读取被拒绝或超过大小上限时，在 rationale 里点名它，结论用 nothing。',
     '',
     '## 负面清单（禁止沉淀）',
     '- 环境依赖故障（缺二进制、凭据未配置——用户自己能修的）；',
@@ -1221,8 +1351,8 @@ const REVIEW_PROMPT_TEXT = {
     '- 未解决的失败——不能把没验证成功的死胡同包装成可靠流程。',
     '',
     '## 优先序',
-    '建议块是本轮唯一的 skill 清单；本轮没有读文件工具，不能读任何 skill 文件，也不能改任何既有 skill。',
-    '1. 建议块里的 skill 已覆盖这条经验：本轮不能 patch（没有读文件工具，拿不到 baseHash），把该 skill 名写进 rationale，结论用 nothing；',
+    '建议块是本轮唯一的 skill 清单，也是唯一可以读的来源；每次复盘最多成功读取 3 个建议块里的 skill 文件，第四次读取会被拒绝。',
+    '1. 建议块里的 skill 已覆盖这条经验：用 read_skill_file 读取它（建议块里该行末尾方括号里的路径），基于读到的全文改写正文，把返回的哈希写进 baseHash 再 patch；读取被拒绝或文件超过上限时，把该 skill 名写进 rationale，结论用 nothing；',
     '2. 建议块里没有任何 skill 能承载这条经验 → CREATE 新 skill；建议块之外的 skill 一律不算覆盖。',
     '',
     '## 命名纪律',
@@ -1253,8 +1383,8 @@ const REVIEW_PROMPT_TEXT = {
     '  "skill": "kebab-case-name",            // create/patch 必填',
     '  "description": "≤500 字符",             // create 必填',
     '  "body": "完整 SKILL.md 正文，不含 frontmatter",  // create/patch 必填',
-    '  "baseHash": "<SKILL.md 全文的 SHA-256>",  // patch 必填；本轮没有读文件工具，不要输出',
-    '  "baseDescription": "<SKILL.md 里的 description 原文>",  // patch 必填；本轮没有读文件工具，不要输出',
+    '  "baseHash": "<read_skill_file 返回的 SHA-256>",  // patch 必填；只能来自本轮的一次读取',
+    '  "baseDescription": "<读到的 SKILL.md 里的 description 原文>",  // patch 必填；取自同一次读取',
     '  "rationale": "一句话：为什么值得存/不值得存",',
     ...(memoryOn ? [
       '  "memory": {                            // 可选；多数复盘应省略整个字段',
@@ -1266,7 +1396,7 @@ const REVIEW_PROMPT_TEXT = {
     ] : []),
     '}',
     '```',
-    'patch 需要读文件工具才能基于目标全文修改；本轮没有读文件工具，所以不要输出 patch。',
+    'patch 必须基于 read_skill_file 返回的全文与哈希；没有读过目标文件就不要输出 patch。',
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
     REVIEW_LANGUAGE_DIRECTIVE.zh,
   ],
@@ -1280,7 +1410,7 @@ const REVIEW_PROMPT_TEXT = {
     '1. The user corrected style/tone/format/verbosity ("stop doing X" / "too verbose" / "just give me the answer") — this is a FIRST-CLASS signal;',
     '2. The user corrected the workflow or the order of steps;',
     '3. A non-trivial technique, fix, workaround, debugging path, or tool usage appeared;',
-    '4. An existing skill listed in the suggestion block was found wrong, incomplete, or outdated → name it in the rationale; this round cannot edit it.',
+    '4. An existing skill listed in the suggestion block was found wrong, incomplete, or outdated → read it with read_skill_file, then patch it with the hash the read returned; if the read is refused or the file is over the ceiling, name it in the rationale and answer nothing.',
     '',
     '## Negative list (never distill these)',
     '- Environment dependency failures (missing binary, unconfigured credentials — things the user can fix themselves);',
@@ -1290,8 +1420,8 @@ const REVIEW_PROMPT_TEXT = {
     '- Unresolved failures — an unverified dead end must never be packaged as a reliable procedure.',
     '',
     '## Priority order',
-    'The suggestion block is the only skill list this round; this round has no read tool, so it cannot read any skill file and cannot change any existing skill.',
-    '1. A skill in the suggestion block already covers the finding: it cannot be patched this round (no read tool, so no baseHash), so name it in the rationale and answer nothing;',
+    'The suggestion block is the only skill list this round and the only source of skill files you may read; a review may read at most three of its skill files successfully, and the fourth is refused.',
+    '1. A skill in the suggestion block already covers the finding: read the bracketed route at the end of its line with read_skill_file, rewrite the body from the text it returned, and put the returned hash in baseHash to patch it; if the read is refused or the file is over the ceiling, name the skill in the rationale and answer nothing;',
     '2. No skill in the suggestion block can carry the finding → CREATE a new skill; a skill outside the block never counts as coverage.',
     '',
     '## Naming discipline',
@@ -1322,8 +1452,8 @@ const REVIEW_PROMPT_TEXT = {
     '  "skill": "kebab-case-name",            // required for create/patch',
     '  "description": "≤500 characters",       // required for create',
     '  "body": "Complete SKILL.md body, without frontmatter",  // required for create/patch',
-    '  "baseHash": "<SHA-256 of the SKILL.md text>",  // required for patch; this round has no read tool, so do not emit it',
-    '  "baseDescription": "<the description field of the SKILL.md>",  // required for patch; this round has no read tool, so do not emit it',
+    '  "baseHash": "<SHA-256 returned by read_skill_file>",  // required for patch; must come from a read in this same review',
+    '  "baseDescription": "<the description field of the SKILL.md you read>",  // required for patch; taken from the same read',
     '  "rationale": "One sentence: why it is worth storing, or why not",',
     ...(memoryOn ? [
       '  "memory": {                            // optional; most reviews should omit the whole field',
@@ -1335,7 +1465,7 @@ const REVIEW_PROMPT_TEXT = {
     ] : []),
     '}',
     '```',
-    'A patch needs a read tool to derive the body from the target text; this round has no read tool, so do not emit a patch.',
+    'A patch must be built from the text and hash read_skill_file returned; never emit a patch for a file you did not read.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
     REVIEW_LANGUAGE_DIRECTIVE.en,
   ],
@@ -1396,6 +1526,8 @@ module.exports = {
     reasonKind, contentToText, renderTranscript,
     extractFencedJson, parseConclusion, parseMemoryConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
     REFERENCE_FILE_MAX_CHARS, REFERENCE_FILES_MAX, REVIEW_LAYOUT_TEXT,
+    // The review agent's one tool: the builder, its cap, and the writer ceiling it mirrors.
+    buildReviewSkillReadTool, REVIEW_SKILL_READ_TOOL, REVIEW_SKILL_READ_MAX, PATCHABLE_BODY_MAX_CHARS,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
     setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
     settingsSchema, Config,
@@ -1903,14 +2035,21 @@ module.exports = {
 
         const cwd = session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
 
-        // 3. zero-tool review agent（进程内、独立会话、不污染会话库）
+        // 3. one-tool review agent（进程内、独立会话、不污染会话库）
         const selection = ctx.agentDefaultModel.currentSelection()
+        // One tool, this run's three-read budget. Registered into the agent's own
+        // scope in `setup`, so the empty inherited allow-list below still leaves
+        // it visible and every other agent keeps its normal tool set.
+        const skillRead = buildReviewSkillReadTool()
         handle = await ctx.agents.create({
           sessionId: 'hermes-loop-review-' + randomUUID(),
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
           agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
           signal: controller.signal,
-          setup: (agentCtx) => { agentCtx.tools.restrict({ allow: [] }) },
+          setup: (agentCtx) => {
+            agentCtx.tools.register(skillRead)
+            agentCtx.tools.restrict({ allow: [] })
+          },
         })
         const agent = handle.agent
         trace('review-agent-created', { reviewSession: agent.id })

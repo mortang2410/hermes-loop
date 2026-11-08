@@ -343,16 +343,28 @@ function fakeServices(conclusionText, { suggestions } = {}) {
   // An earlier fixture modelled two contexts with independent switches, which is
   // a state the host cannot produce (found in review round 2).
   //
-  // `tools` is present because `setup` always calls `agentCtx.tools.restrict`.
+  // `tools` is present because `setup` registers the review agent's one tool and
+  // restricts its inherited allow-list. `schemas()` models the visible set: a
+  // scoped restriction never hides the scope's own registrations (dsh-tools view()).
+  const registered = []
+  const restrictions = []
+  const tools = {
+    register(definition) { registered.push(definition); return () => {} },
+    restrict(filter) { restrictions.push(filter); return () => {} },
+    schemas() { return registered.map(({ name, description, parameters }) => ({ name, description, parameters })) },
+  }
   const agentCtx = {
     get: () => undefined,
-    tools: { restrict() {} },
+    tools,
   }
   agent.ctx = agentCtx
   return {
     created,
     agent,
     agentCtx,
+    registered,
+    restrictions,
+    tools,
     // The router service the review asks for. A healthy empty answer is the
     // default so a test about any other arm does not have to model the router.
     suggestions: suggestions === undefined
@@ -430,18 +442,27 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
     const conclusion = JSON.stringify({ action: 'create', skill: 'e2e-skill', description: 'from e2e test', body: 'e2e body' })
     const services = fakeServices('```json\n' + conclusion + '\n```')
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    // Nothing is registered at plugin load: the tool lives in the review agent's
+    // own scope only, so a normal agent's tool set is unchanged.
+    assert.equal(services.registered.length, 0)
     const session = { id: 'session-e2e', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'do the thing' }] }
     t.fire(session, completedTurn)
     await new Promise((r) => setTimeout(r, 80))
     const written = await readFile(join(home, 'skills', 'e2e-skill', 'SKILL.md'), 'utf8')
     assert.match(written, /e2e body/)
     assert.match(written, /description: "from e2e test"/)
-    // review agent was created zero-tool, standard preset, subagent origin, dedicated namespace
+    // The review agent was created with exactly its one tool, standard preset,
+    // subagent origin, dedicated namespace.
     const createOpts = services.created.find((c) => c && c.sessionId)
     assert.match(createOpts.sessionId, /^hermes-loop-review-/)
     assert.equal(createOpts.meta.origin, 'subagent')
     assert.equal(createOpts.meta.agentPreset, 'standard')
     assert.match(createOpts.meta.cwd, /hermes-loop-home-/)
+    // Registration is proven on the visible set, not on the call: the inherited
+    // allow-list is empty and the scoped read tool is still what the model sees.
+    assert.deepEqual(services.restrictions, [{ allow: [] }], 'the inherited allow-list stays empty')
+    assert.deepEqual(services.registered.map((definition) => definition.name), ['read_skill_file'])
+    assert.deepEqual(services.tools.schemas().map((schema) => schema.name), ['read_skill_file'], 'one visible tool')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome

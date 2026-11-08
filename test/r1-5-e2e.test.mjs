@@ -22,7 +22,7 @@ function fakeServices(conclusionText) {
     whenIdle: async () => {},
     cancel() {},
   }
-  const agentCtx = { get: () => undefined, tools: { restrict() {} } }
+  const agentCtx = { get: () => undefined, tools: { register() {}, restrict() {} } }
   agent.ctx = agentCtx
   return {
     created,
