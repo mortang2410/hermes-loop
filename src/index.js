@@ -288,6 +288,36 @@ function memoryDir() {
   return join(dshHome(), 'memory')
 }
 
+/**
+ * Move one finished review session out of the live session store.
+ *
+ * The agent registry's `dispose()` unregisters the agent, but the store keeps the
+ * review's directory on disk: 1,476 `hermes-loop-review-*` directories had piled up
+ * that way by 2026-11-09, one per hourly review, and every session-list load walks
+ * them. Moving the directory keeps the transcript (nothing is deleted) and leaves
+ * the live store holding only sessions the user can open.
+ */
+async function archiveReviewSessionDir(sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId.startsWith('hermes-loop-review-')) return
+  const store = join(dshHome(), 'sessions')
+  const buckets = await fsP.readdir(store, { withFileTypes: true }).catch(() => [])
+  for (const bucket of buckets) {
+    if (!bucket.isDirectory()) continue
+    const from = join(store, bucket.name, sessionId)
+    try {
+      await fsP.access(from)
+    } catch {
+      continue
+    }
+    const to = join(dshHome(), 'hermes-loop', 'review-archive', bucket.name)
+    try {
+      await fsP.mkdir(to, { recursive: true })
+      await fsP.rename(from, join(to, sessionId))
+    } catch {}
+    return
+  }
+}
+
 // ── Pure helpers (unit-tested via __internals) ──────────────────────────
 
 /** `turn/end` reason arrives as `{kind: 'completed'}`; tolerate a bare string. */
@@ -2200,7 +2230,10 @@ module.exports = {
       } finally {
         running = null
         runningSince = null
-        if (handle) { try { await handle.dispose() } catch {} }
+        if (handle) {
+          try { await handle.dispose() } catch {}
+          try { await archiveReviewSessionDir(handle.agent.id) } catch {}
+        }
         drainNext()
       }
     }
