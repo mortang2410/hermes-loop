@@ -468,6 +468,16 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
   try {
     const conclusion = JSON.stringify({ action: 'create', skill: 'e2e-skill', description: 'from e2e test', body: 'e2e body' })
     const services = fakeServices('```json\n' + conclusion + '\n```')
+    // The review's directory is materialized in the store the way the host leaves
+    // it, and the fake agent reports that same id. Deleting the teardown's archive
+    // call then leaves this directory behind, which the helper-only test cannot
+    // see: that test proves the move works, not that the runner asks for it.
+    const reviewId = 'hermes-loop-review-00000000-0000-4000-8000-000000000001'
+    const bucket = 'e2e-bucket'
+    const storeDir = join(home, 'sessions', bucket, reviewId)
+    await mkdir(storeDir, { recursive: true })
+    await writeFile(join(storeDir, 'session.v4.jsonl.zstd'), 'review transcript')
+    services.agent.id = reviewId
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
     // Nothing is registered at plugin load: the tool lives in the review agent's
     // own scope only, so a normal agent's tool set is unchanged.
@@ -492,6 +502,46 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
     assert.deepEqual(services.registered.map((definition) => definition.name), ['read_skill_file'])
     assert.deepEqual(services.tools.schemas().map((schema) => schema.name), ['read_skill_file'], 'one visible tool; the inherited tool is masked')
     assert.deepEqual(services.tools.siblingSchemas().map((schema) => schema.name), ['inherited_tool'], 'a normal agent still sees the inherited tool')
+    // The teardown moved the finished review out of the live store, bucket and
+    // bytes intact. This is the call-site pin: with the archive call deleted from
+    // the runner's `finally`, the store copy below survives and this fails.
+    const archivedDir = join(home, 'hermes-loop', 'review-archive', bucket, reviewId)
+    assert.equal(await readFile(join(archivedDir, 'session.v4.jsonl.zstd'), 'utf8'), 'review transcript')
+    await assert.rejects(readFile(join(storeDir, 'session.v4.jsonl.zstd')), 'the store copy is gone after the review')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('loop end-to-end: a review whose creation throws still archives its directory', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-home-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    let requested
+    services.agents.create = async (opts) => {
+      requested = opts.sessionId
+      // The host's `setupAndPublish` appends the log, then a serial
+      // `agent/created` listener can reject: the directory exists on disk while
+      // the caller never receives a handle.
+      const dir = join(home, 'sessions', 'e2e-bucket', opts.sessionId)
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, 'session.lock'), '')
+      throw new Error('serial agent/created listener rejected')
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-create-fail', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'do the thing' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 80))
+    assert.match(requested, /^hermes-loop-review-/)
+    assert.ok(t.warns.some((m) => m.includes('review task')), t.warns.join('|'))
+    // With no handle the requested id is the only name for the residue, so the
+    // archive has to use it.
+    await assert.rejects(readFile(join(home, 'sessions', 'e2e-bucket', requested, 'session.lock')), 'the failed create left nothing in the live store')
+    assert.equal(await readFile(join(home, 'hermes-loop', 'review-archive', 'e2e-bucket', requested, 'session.lock'), 'utf8'), '')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome

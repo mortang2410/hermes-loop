@@ -2043,6 +2043,11 @@ module.exports = {
       trace('review-start', { sessionId, manual, signal: firedSignal && firedSignal.kind, signalDetail: firedSignal && firedSignal.detail })
 
       let handle
+      // The requested id is also the archive key. `agents.create` can publish the
+      // log and then reject before returning a handle (a serial `agent/created`
+      // listener running inside the agent loop's `setupAndPublish`), and that
+      // directory is exactly the residue this run has to clear.
+      let reviewSessionId
       try {
         // One language decision per review run, so the truncation marker, the
         // memory block, the prompt, and the input headings cannot disagree.
@@ -2095,8 +2100,9 @@ module.exports = {
         // scope in `setup`, so the empty inherited allow-list below still leaves
         // it visible and every other agent keeps its normal tool set.
         const skillRead = buildReviewSkillReadTool()
+        reviewSessionId = 'hermes-loop-review-' + randomUUID()
         handle = await ctx.agents.create({
-          sessionId: 'hermes-loop-review-' + randomUUID(),
+          sessionId: reviewSessionId,
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
           agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
           signal: controller.signal,
@@ -2233,8 +2239,11 @@ module.exports = {
         runningSince = null
         if (handle) {
           try { await handle.dispose() } catch {}
-          try { await archiveReviewSessionDir(handle.agent.id) } catch {}
         }
+        // Archive by the registry's id when creation succeeded, else by the id
+        // that was requested: a create that threw after materializing the log
+        // returns no handle, and the helper no-ops when nothing was written.
+        try { await archiveReviewSessionDir(handle ? handle.agent.id : reviewSessionId) } catch {}
         drainNext()
       }
     }
