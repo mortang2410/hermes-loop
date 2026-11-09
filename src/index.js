@@ -1582,6 +1582,7 @@ module.exports = {
     // The review agent's one tool: the builder, its cap, and the writer ceiling it mirrors.
     buildReviewSkillReadTool, REVIEW_SKILL_READ_TOOL, REVIEW_SKILL_READ_MAX, PATCHABLE_BODY_MAX_CHARS,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
+    archiveReviewSessionDir,
     setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
     settingsSchema, Config,
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
